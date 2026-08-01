@@ -22,8 +22,8 @@ from index_loader import load_etf_mapping
 from data_fetcher import fetch_margin_batch, _get_trading_dates
 from aggregator import aggregate_all_indices
 
-# 云端只需保留 45 个交易日（覆盖 30 日变化 + 缓冲）
-LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", "45"))
+# 云端只需保留 100 个交易日（覆盖 30 日变化 + 缓冲）
+LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", "100"))
 
 
 def _cached_dates():
