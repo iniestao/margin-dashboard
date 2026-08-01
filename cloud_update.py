@@ -6,7 +6,7 @@
 说明:
     1. 增量拉取近 N 个交易日的融资融券数据（SSE + SZSE）
     2. 按指数成分股聚合，写入 data/aggregated/
-    3. 拉取天数可用环境变量 LOOKBACK_DAYS 覆盖（云端默认 45 天，够算 30 日变化）
+    3. 拉取天数可用环境变量 LOOKBACK_DAYS 覆盖（云端默认 100 天，够算 30 日变化）
 """
 
 import sys
