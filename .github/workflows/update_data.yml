@@ -2,9 +2,9 @@ name: 每日数据更新
 
 on:
   schedule:
-    # 每天北京时间 09:00（开盘前看板即为最新）= UTC 01:00
+    # 每天北京时间 08:55（开盘前看板即为最新）= UTC 00:55
     # 融资数据为上一交易日盘后公布，9 点拉取即最新；周末/节假日自动跳过非交易日
-    - cron: "0 1 * * *"
+    - cron: "55 0 * * *"
   workflow_dispatch: {}   # 支持在 Actions 页面手动触发（首次部署用）
 
 jobs:
@@ -33,6 +33,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
           git add data
           git diff --quiet && git diff --cached --quiet || git commit -m "chore(data): 每日融资数据更新 $(date -u +%Y-%m-%d)"
           git push
