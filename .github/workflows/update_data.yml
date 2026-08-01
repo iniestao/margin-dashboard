@@ -27,7 +27,7 @@ jobs:
       - name: 更新数据
         run: python cloud_update.py
         env:
-          LOOKBACK_DAYS: "45"
+          LOOKBACK_DAYS: "100"
 
       - name: 提交数据回仓库
         run: |
