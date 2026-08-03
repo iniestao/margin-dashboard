@@ -43,6 +43,16 @@ def main():
     else:
         print(f">>> 融资融券缓存完整 ({len(cached)} 个交易日)")
 
+    # 1.5 增量拉取 ETF 份额
+    from etf_fetcher import fetch_etf_scale_batch, _cached_dates as etf_cached_dates_fn
+    etf_cached = etf_cached_dates_fn()
+    etf_missing = sorted(all_dates - etf_cached, reverse=True)
+    if etf_missing:
+        print(f">>> ETF份额缺少 {len(etf_missing)} 个交易日: {etf_missing[0]} ~ {etf_missing[-1]}")
+        fetch_etf_scale_batch(etf_missing)
+    else:
+        print(f">>> ETF份额缓存完整 ({len(etf_cached)} 个交易日)")
+
     # 2. 重新聚合
     margin_all = _load_margin_cache()
     if margin_all.empty:
