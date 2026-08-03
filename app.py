@@ -80,6 +80,53 @@ def compute_changes(dfs, lb):
     return pd.DataFrame(rows).sort_values("融资变化%", ascending=False)
 
 
+@st.cache_data(ttl=3600)
+def compute_market_overview():
+    """全市场融资概览：全市场（非仅指数成分）融资余额/买入额的历史汇总与关键指标"""
+    margin_all = load_margin_history()
+    if margin_all is None or margin_all.empty:
+        return None
+    if "rzye" not in margin_all.columns:
+        return None
+
+    df = margin_all.copy()
+    daily = df.groupby("trade_date").agg(
+        total_balance=("rzye", "sum"),
+        total_buy=("rzmre", "sum"),
+    ).sort_index()
+    if daily.empty:
+        return None
+
+    latest = daily.iloc[-1]
+    cur_bal = float(latest["total_balance"])
+
+    def pct_chg(days):
+        if len(daily) > days:
+            prev = float(daily.iloc[-(days + 1)]["total_balance"])
+            if prev and prev > 0:
+                return (cur_bal - prev) / prev * 100
+        return None
+
+    return {
+        "daily": daily,
+        "latest_date": daily.index[-1],
+        "balance": cur_bal,
+        "buy": float(latest["total_buy"]),
+        "chg5": pct_chg(5),
+        "chg15": pct_chg(15),
+        "chg30": pct_chg(30),
+    }
+
+
+def fmt_amount(v: float) -> str:
+    """金额格式化：>=1万亿显示万亿，否则显示亿"""
+    if v is None or (isinstance(v, float) and (v != v)):
+        return "N/A"
+    if v >= 1e12:
+        return f"{v / 1e12:.2f}万亿"
+    return f"{v / 1e8:,.0f}亿"
+
+
 # ── 全局样式 ──
 st.markdown("""
 <style>
@@ -119,6 +166,64 @@ results = load_aggregated()
 margin_all = load_margin_history()
 
 st.markdown("""<h1>A股指数融资变化看板</h1>""", unsafe_allow_html=True)
+
+# ── 全市场融资概览 ──
+overview = compute_market_overview()
+if overview is not None:
+    st.markdown("### 全市场融资概览")
+    daily = overview["daily"]
+    bal_txt = fmt_amount(overview["balance"])
+    buy_txt = fmt_amount(overview["buy"])
+    latest_str = overview["latest_date"].strftime("%Y-%m-%d")
+
+    m1, m2, m3, m4, m5 = st.columns(5, gap="medium")
+    with m1:
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">全市场融资余额</div>
+        <div class="metric-value" style="font-size:19px">{bal_txt}</div>
+        <div class="metric-sub">{latest_str}</div></div>""", unsafe_allow_html=True)
+    for col, label, v in [(m2, "较5日前", overview["chg5"]),
+                          (m3, "较15日前", overview["chg15"]),
+                          (m4, "较30日前", overview["chg30"])]:
+        with col:
+            if v is None:
+                txt, color = "N/A", "#AAA"
+            else:
+                txt, color = f"{v:+.2f}%", pct_color(v)
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">{label}</div>
+            <div class="metric-value" style="font-size:19px;color:{color}">{txt}</div>
+            <div class="metric-sub">融资余额变化</div></div>""", unsafe_allow_html=True)
+    with m5:
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">最新融资买入额</div>
+        <div class="metric-value" style="font-size:19px">{buy_txt}</div>
+        <div class="metric-sub">{latest_str}</div></div>""", unsafe_allow_html=True)
+
+    # 全市场融资余额历史曲线 + 每日买入额（副轴）
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=daily.index, y=daily["total_balance"] / 1e8,
+        name="全市场融资余额", line=dict(width=2.5, color="#185FA5"),
+        hovertemplate="%{x|%Y-%m-%d}<br>余额 %{y:,.0f}亿<extra></extra>",
+    ), secondary_y=False)
+    fig.add_trace(go.Bar(
+        x=daily.index, y=daily["total_buy"] / 1e8,
+        name="每日融资买入额", marker_color="rgba(226,74,74,0.30)",
+        hovertemplate="%{x|%Y-%m-%d}<br>买入 %{y:,.0f}亿<extra></extra>",
+    ), secondary_y=True)
+    fig.update_layout(
+        height=360, margin=dict(l=0, r=0, t=0, b=0), bargap=0.4,
+        legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center",
+                    font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+        hovermode="x unified",
+        xaxis=dict(type="date", tickformat="%m-%d", showgrid=True, gridcolor="#f0f0f0",
+                   showline=False, tickfont=dict(size=11, color="#888")),
+        yaxis=dict(title="融资余额(亿元)", showgrid=True, gridcolor="#f0f0f0",
+                   showline=False, tickfont=dict(size=11, color="#888")),
+        yaxis2=dict(title="买入额(亿元)", showgrid=False, showline=False,
+                    tickfont=dict(size=11, color="#AAA")),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Microsoft YaHei, PingFang SC, sans-serif"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 if not results:
     st.warning("数据生成中，请稍候几分钟后再刷新。首次部署需在 GitHub Actions 手动触发一次「每日数据更新」。")
