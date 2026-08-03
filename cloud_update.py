@@ -27,12 +27,15 @@ LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", "100"))
 
 
 def _cached_dates():
-    dates = set()
-    for f in MARGIN_DIR.glob("*.parquet"):
-        parts = f.stem.split("_")
-        if len(parts) >= 2:
-            dates.add(parts[1])
-    return dates
+    """返回 SSE 与 SZSE 两边都完整的日期（单边缓存视为未完成，会触发重拉）"""
+    def _side_dates(prefix: str) -> set:
+        s = set()
+        for f in MARGIN_DIR.glob(f"{prefix}_*.parquet"):
+            parts = f.stem.split("_")
+            if len(parts) >= 2:
+                s.add(parts[1])
+        return s
+    return _side_dates("sh") & _side_dates("sz")
 
 
 def _load_margin_cache():

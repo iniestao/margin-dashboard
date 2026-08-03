@@ -92,53 +92,71 @@ def _fetch_sse_margin_detail_direct(date_str: str) -> pd.DataFrame:
 
 
 def fetch_margin_single_date(date_str: str) -> pd.DataFrame:
-    """拉取单日全市场融资融券明细"""
+    """拉取单日全市场融资融券明细。
+
+    完整性规则（重要）：
+        SSE 与 SZSE 两个交易所的数据必须同时成功才保存缓存；
+        若只有一方返回（数据发布延迟/单边缺失），不保存任何文件，
+        该日期视为未完成，等待下次运行自动重试。
+        已存在的单边缓存文件会被删除后重新拉取。
+    """
     MARGIN_DIR.mkdir(parents=True, exist_ok=True)
-    dfs = []
-
-    # SSE: 直接查询官方API
     cache_sse = MARGIN_DIR / f"sh_{date_str}.parquet"
-    if cache_sse.exists():
-        dfs.append(pd.read_parquet(cache_sse))
-    else:
-        try:
-            df_sse = _fetch_sse_margin_detail_direct(date_str)
-            if not df_sse.empty:
-                df_sse.to_parquet(cache_sse, index=False)
-                dfs.append(df_sse)
-            else:
-                print(f"  [融资融券] SSE {date_str}: 无数据或非交易日")
-        except Exception as e:
-            print(f"  [融资融券] SSE {date_str} 失败: {e}")
-        time.sleep(REQUEST_INTERVAL)
-
-    # SZSE: AKShare — 直接用原始列名，跳过 rename
     cache_sz = MARGIN_DIR / f"sz_{date_str}.parquet"
-    if cache_sz.exists():
-        dfs.append(pd.read_parquet(cache_sz))
-    else:
-        try:
-            df_raw = ak.stock_margin_detail_szse(date=date_str)
-            if df_raw is not None and not df_raw.empty:
-                df_sz = pd.DataFrame()
-                df_sz["stock_code"] = df_raw["证券代码"].astype(str).str.zfill(6)
-                for src, dst in [("融资余额", "rzye"), ("融资买入额", "rzmre"),
-                                 ("融券余量", "rqyl"), ("融券余额", "rqye")]:
-                    if src in df_raw.columns:
-                        df_sz[dst] = pd.to_numeric(df_raw[src], errors="coerce")
-                # SZSE 没有 trade_date 列，用参数 date_str
-                df_sz["trade_date"] = date_str
-                df_sz.to_parquet(cache_sz, index=False)
-                dfs.append(df_sz)
-            time.sleep(REQUEST_INTERVAL)
-        except Exception as e:
-            print(f"  [融资融券] SZSE {date_str} 失败: {e}")
 
-    if dfs:
-        result = pd.concat(dfs, ignore_index=True)
-        result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
-        return result
-    return pd.DataFrame()
+    # 已有完整缓存（两边都在）→ 直接读
+    if cache_sse.exists() and cache_sz.exists():
+        return pd.concat([pd.read_parquet(cache_sse), pd.read_parquet(cache_sz)],
+                         ignore_index=True)
+
+    # 只有一边的残缺缓存 → 删掉重拉（可能是历史遗留的单边文件）
+    for p in (cache_sse, cache_sz):
+        if p.exists():
+            print(f"  [融资融券] {date_str} 缓存不完整(仅单边)，删除重拉: {p.name}")
+            p.unlink()
+
+    # ── 拉取 SSE ──
+    df_sse = pd.DataFrame()
+    try:
+        df_sse = _fetch_sse_margin_detail_direct(date_str)
+    except Exception as e:
+        print(f"  [融资融券] SSE {date_str} 失败: {e}")
+    time.sleep(REQUEST_INTERVAL)
+
+    # ── 拉取 SZSE ──
+    df_sz = pd.DataFrame()
+    try:
+        df_raw = ak.stock_margin_detail_szse(date=date_str)
+        if df_raw is not None and not df_raw.empty:
+            df_sz = pd.DataFrame()
+            df_sz["stock_code"] = df_raw["证券代码"].astype(str).str.zfill(6)
+            for src, dst in [("融资余额", "rzye"), ("融资买入额", "rzmre"),
+                             ("融券余量", "rqyl"), ("融券余额", "rqye")]:
+                if src in df_raw.columns:
+                    df_sz[dst] = pd.to_numeric(df_raw[src], errors="coerce")
+            # SZSE 没有 trade_date 列，用参数 date_str
+            df_sz["trade_date"] = date_str
+    except Exception as e:
+        print(f"  [融资融券] SZSE {date_str} 失败: {e}")
+    time.sleep(REQUEST_INTERVAL)
+
+    # 两个交易所都为空 → 数据未公布或非交易日，不缓存
+    if df_sse.empty and df_sz.empty:
+        print(f"  [融资融券] {date_str}: 两所均无数据（未公布或非交易日）")
+        return pd.DataFrame()
+
+    # 只有一方成功 → 数据不完整，不保存缓存，下次重试
+    if df_sse.empty or df_sz.empty:
+        side = "SSE" if not df_sse.empty else "SZSE"
+        print(f"  [融资融券] {date_str}: 仅 {side} 返回数据，不完整，不保存缓存，等待下次重试")
+        return pd.DataFrame()
+
+    # 两所都成功 → 保存缓存并返回
+    df_sse.to_parquet(cache_sse, index=False)
+    df_sz.to_parquet(cache_sz, index=False)
+    result = pd.concat([df_sse, df_sz], ignore_index=True)
+    result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
+    return result
 
 
 def fetch_margin_batch(dates: list[str]) -> pd.DataFrame:
