@@ -296,6 +296,15 @@ def color_pct(v):
     return f"color:{RED}" if v > 0 else f"color:{GREEN}"
 
 
+def style_color(df: pd.DataFrame, cols: list):
+    """对指定列应用红涨绿跌着色（兼容 pandas 2.1+ 的 Styler.map 与旧版 applymap）"""
+    styler = df.style
+    fn = getattr(styler, "map", None)
+    if fn is None:
+        fn = styler.applymap
+    return fn(color_pct, subset=cols)
+
+
 # ── 全局样式 ──
 st.markdown("""
 <style>
@@ -687,7 +696,7 @@ with tab2:
                         detail_sorted = detail.sort_values(sort_by, ascending=False, na_position="last")
                         chg_cols = [c for c in ["1日变化(亿份)", "5日变化(亿份)", "20日变化(亿份)", "60日变化(亿份)"]
                                     if c in detail_sorted.columns]
-                        styled = detail_sorted.style.applymap(color_pct, subset=chg_cols)
+                        styled = style_color(detail_sorted, chg_cols)
                         st.dataframe(styled, use_container_width=True, hide_index=True,
                                      column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in chg_cols})
 
@@ -749,7 +758,7 @@ with tab2:
                     asc_all = sort_all == "最新份额(亿份)"
                     etf_changes = etf_changes.sort_values(sort_all, ascending=asc_all, na_position="last")
                 pct_cols_all = [c for c in ["1日变化%", "5日变化%", "20日变化%"] if c in etf_changes.columns]
-                styled_all = etf_changes.style.applymap(color_pct, subset=pct_cols_all)
+                styled_all = style_color(etf_changes, pct_cols_all)
                 st.dataframe(styled_all, use_container_width=True, hide_index=True,
                              column_config={c: st.column_config.NumberColumn(format="%+.2f%%") for c in pct_cols_all})
 
