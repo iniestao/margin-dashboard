@@ -24,16 +24,20 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 更新数据
+      - name: 同步远程最新代码（确保本地与远程一致）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: 更新数据（增量追加）
         run: python cloud_update.py
         env:
           LOOKBACK_DAYS: "100"
 
       - name: 提交数据回仓库
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
           git add data
           git diff --quiet && git diff --cached --quiet || git commit -m "chore(data): 每日融资数据更新 $(date -u +%Y-%m-%d)"
           git push
