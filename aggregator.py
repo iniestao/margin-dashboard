@@ -54,10 +54,13 @@ def aggregate_index(
     if fund_flow_df is not None and not fund_flow_df.empty and "ts_code" in fund_flow_df.columns:
         ff = fund_flow_df[fund_flow_df["ts_code"].str.split(".").str[0].isin(constituents)].copy()
         if not ff.empty:
-            ff_agg = ff.groupby("trade_date").agg(
-                total_main_net=("main_net_amount", "sum"),
-                fund_flow_stock_count=("ts_code", "nunique"),
-            ).reset_index()
+            agg_map = {"total_main_net": ("main_net_amount", "sum"),
+                       "fund_flow_stock_count": ("ts_code", "nunique")}
+            if "mid_net_amount" in ff.columns:
+                agg_map["total_mid_net"] = ("mid_net_amount", "sum")
+            if "small_net_amount" in ff.columns:
+                agg_map["total_small_net"] = ("small_net_amount", "sum")
+            ff_agg = ff.groupby("trade_date").agg(**agg_map).reset_index()
         else:
             ff_agg = pd.DataFrame()
     else:

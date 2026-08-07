@@ -1,11 +1,13 @@
-"""ETF 份额数据拉取模块 —— 按交易日增量拉取沪深两市 ETF 份额，本地缓存
+"""ETF 份额/净值数据拉取模块 —— 按交易日增量拉取沪深两市 ETF 份额与单位净值
 
-数据源（均为交易所官方，免费无 token）：
-    沪市: akshare fund_etf_scale_sse(date)  ← query.sse.com.cn 基金规模接口
-    深市: akshare fund_scale_daily_szse     ← szse.cn 基金规模报表
+数据源（免费无 token）：
+    沪市份额: akshare fund_etf_scale_sse(date)  ← query.sse.com.cn 基金规模接口
+    深市份额: akshare fund_scale_daily_szse     ← szse.cn 基金规模报表
+    单位净值: akshare fund_open_fund_info_em    ← 天天基金网（东财）净值披露
 
 缓存规则（与融资数据一致）：
-    - 每个交易日一个文件，沪市 sh_YYYYMMDD.parquet、深市 sz_YYYYMMDD.parquet
+    - 份额：每个交易日一个文件，沪市 sh_YYYYMMDD.parquet、深市 sz_YYYYMMDD.parquet
+    - 净值：每只 ETF 一个文件（全历史），data/etf_nav/{code}.parquet
     - 沪深两市都成功才保存；单边缺失不保存，等待下次重试（历史日期可回补）
 """
 
@@ -15,7 +17,44 @@ import akshare as ak
 import pandas as pd
 from pathlib import Path
 
-from config import ETF_SCALE_DIR, REQUEST_INTERVAL
+from config import ETF_SCALE_DIR, ETF_NAV_DIR, REQUEST_INTERVAL
+
+
+# 国家队持仓 ETF 池 —— 中央汇金系 2025 年报披露完整重仓清单
+# 依据：中国证券报/Wind（2025年末）：汇金投资持 21 只 + 汇金资管持 15 只（去重后 24 只宽基）
+NATIONAL_TEAM_ETF = {
+    # ── 沪深300 系（汇金持仓最重）──
+    "510300": "华泰柏瑞300ETF",   # 投资+资管 82.76%
+    "510310": "易方达300ETF",     # 投资+资管 ~85%
+    "510330": "华夏300ETF",       # 投资+资管
+    "159919": "嘉实300ETF",       # 投资+资管
+    # ── 上证50 ──
+    "510050": "华夏上证50ETF",    # 投资+资管 86.05%
+    "510100": "易方达上证50ETF",  # 汇金投资 5.83%
+    # ── 中证500 ──
+    "510500": "南方中证500ETF",   # 投资+资管
+    "512500": "华夏中证500ETF",   # 汇金投资（华夏汇金资管计划增持）
+    "159922": "嘉实中证500ETF",   # 汇金投资
+    # ── 创业板 ──
+    "159915": "创业板ETF易方达",   # 投资+资管 54.03%
+    "159952": "广发创业板ETF",    # 汇金投资
+    "159977": "天弘创业板ETF",    # 汇金投资 2025Q4 增持
+    # ── 科创板50 ──
+    "588000": "华夏科创50ETF",    # 汇金投资+资管
+    "588080": "易方达科创50ETF",  # 投资+资管
+    "588050": "工银瑞信科创50ETF",  # 汇金投资
+    # ── 中证1000 ──
+    "512100": "南方中证1000ETF",  # 投资+资管
+    "159845": "华夏中证1000ETF",  # 投资+资管
+    "560010": "广发中证1000ETF",  # 投资+资管（>40%）
+    "159629": "富国中证1000ETF",  # 投资+资管
+    # ── 其他宽基 ──
+    "510180": "华安上证180ETF",   # 汇金投资 91.93%
+    "510230": "国泰上证180金融ETF",  # 汇金投资 77.59%
+    "159901": "易方达深证100ETF", # 投资+资管
+    "515800": "汇添富中证800ETF", # 汇金资管
+    "560050": "汇添富MSCI中国A50ETF",  # 汇金资管
+}
 
 
 def _cached_dates() -> set:
@@ -136,6 +175,72 @@ def load_etf_scale_cache() -> pd.DataFrame:
     df = pd.concat(dfs, ignore_index=True)
     df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
     return df.dropna(subset=["trade_date"])
+
+
+# ============================================================
+#  ETF 单位净值（天天基金网）—— 用于计算 ETF 规模金额 = 份额 × 净值
+# ============================================================
+
+def fetch_etf_nav(codes: list[str]) -> pd.DataFrame:
+    """拉取指定 ETF 的单位净值历史（全量覆盖写 data/etf_nav/{code}.parquet）
+
+    净值数据源：天天基金网（fund.eastmoney.com），基金公司每日披露，历史可回补。
+    """
+    ETF_NAV_DIR.mkdir(parents=True, exist_ok=True)
+    all_data = []
+    for i, code in enumerate(codes):
+        cache = ETF_NAV_DIR / f"{code}.parquet"
+        # 已有缓存且非强制刷新 → 跳过（净值每日披露，缓存一般已是最新）
+        if cache.exists():
+            all_data.append(pd.read_parquet(cache))
+            continue
+        try:
+            nav = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+            if nav is None or nav.empty:
+                print(f"  [ETF净值] {code} 无数据")
+                continue
+            out = pd.DataFrame({
+                "fund_code": code,
+                "nav_date": pd.to_datetime(nav["净值日期"], errors="coerce"),
+                "unit_nav": pd.to_numeric(nav["单位净值"], errors="coerce"),
+            }).dropna(subset=["nav_date", "unit_nav"])
+            if out.empty:
+                print(f"  [ETF净值] {code} 解析为空")
+                continue
+            out.to_parquet(cache, index=False)
+            all_data.append(out)
+            print(f"  [ETF净值] {code}: {len(out)} 条 (最新 {out['nav_date'].max().date()})")
+        except Exception as e:
+            print(f"  [ETF净值] {code} 失败: {e}")
+        time.sleep(REQUEST_INTERVAL)
+    if all_data:
+        return pd.concat(all_data, ignore_index=True)
+    return pd.DataFrame()
+
+
+def load_etf_nav_cache() -> pd.DataFrame:
+    """读取全部已缓存的 ETF 净值（用于看板展示）"""
+    files = sorted(ETF_NAV_DIR.glob("*.parquet"))
+    if not files:
+        return pd.DataFrame()
+    dfs = [pd.read_parquet(f) for f in files]
+    df = pd.concat(dfs, ignore_index=True)
+    df["nav_date"] = pd.to_datetime(df["nav_date"], errors="coerce")
+    return df.dropna(subset=["nav_date"])
+
+
+def compute_etf_amount(scale_df: pd.DataFrame, nav_df: pd.DataFrame) -> pd.DataFrame:
+    """按日期把份额 × 净值 得到规模金额。
+
+    返回 scale_df 基础上新增 amount(元)：amount = total_share × unit_nav
+    """
+    if scale_df is None or scale_df.empty or nav_df is None or nav_df.empty:
+        return scale_df.copy() if scale_df is not None else pd.DataFrame()
+    nav = nav_df.rename(columns={"nav_date": "trade_date"})
+    merged = scale_df.merge(nav[["fund_code", "trade_date", "unit_nav"]],
+                            on=["fund_code", "trade_date"], how="left")
+    merged["amount"] = merged["total_share"] * merged["unit_nav"]
+    return merged
 
 
 if __name__ == "__main__":
