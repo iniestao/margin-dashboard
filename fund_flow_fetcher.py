@@ -106,6 +106,9 @@ def load_fund_flow_cache() -> pd.DataFrame:
     dfs = [pd.read_parquet(f) for f in files]
     df = pd.concat(dfs, ignore_index=True)
     df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    # aggregator 按 ts_code 过滤成分股（6位代码可直接匹配），补上兼容列
+    if "stock_code" in df.columns:
+        df["ts_code"] = df["stock_code"]
     return df.dropna(subset=["trade_date"])
 
 
