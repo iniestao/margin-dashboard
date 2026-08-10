@@ -80,14 +80,18 @@ def aggregate_index(
     else:
         mc_agg = pd.DataFrame()
 
-    # ── 合并 ──
+    # ── 合并（统一 trade_date 为 datetime，避免 str 与 datetime 混并）──
     result = None
     for part in [margin_agg, ff_agg, mc_agg]:
         if part.empty:
             continue
+        part = part.copy()
+        part["trade_date"] = pd.to_datetime(part["trade_date"], errors="coerce")
+        part = part.dropna(subset=["trade_date"])
         if result is None:
             result = part
         else:
+            result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
             result = result.merge(part, on="trade_date", how="outer")
 
     if result is None or result.empty:
