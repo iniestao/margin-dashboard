@@ -185,13 +185,33 @@ def fetch_etf_nav(codes: list[str]) -> pd.DataFrame:
     """拉取指定 ETF 的单位净值历史（全量覆盖写 data/etf_nav/{code}.parquet）
 
     净值数据源：天天基金网（fund.eastmoney.com），基金公司每日披露，历史可回补。
+    缓存策略：若缓存最新净值日期已覆盖"最近已收盘交易日"则跳过，否则重拉（保证每日更新）。
     """
+    from datetime import datetime
+    from data_fetcher import _get_trading_dates
+
     ETF_NAV_DIR.mkdir(parents=True, exist_ok=True)
+    # 目标 = 最近已收盘交易日（今天未收盘则取上一交易日）
+    tdates = _get_trading_dates(10)
+    today = datetime.now().strftime("%Y%m%d")
+    target = tdates[0] if tdates else today
+    if tdates and tdates[0] == today and datetime.now().hour < 15:
+        target = tdates[1] if len(tdates) > 1 else tdates[0]
+    target_dt = pd.to_datetime(target)
+
     all_data = []
     for i, code in enumerate(codes):
         cache = ETF_NAV_DIR / f"{code}.parquet"
-        # 已有缓存且非强制刷新 → 跳过（净值每日披露，缓存一般已是最新）
+        need_fetch = not cache.exists()
         if cache.exists():
+            # 缓存已含最近交易日 → 跳过；否则重拉
+            try:
+                cached = pd.read_parquet(cache)
+                latest_nav = pd.to_datetime(cached["nav_date"], errors="coerce").max()
+                need_fetch = pd.isna(latest_nav) or latest_nav < target_dt
+            except Exception:
+                need_fetch = True
+        if not need_fetch:
             all_data.append(pd.read_parquet(cache))
             continue
         try:
