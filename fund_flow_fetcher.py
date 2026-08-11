@@ -65,10 +65,16 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
         return pd.read_parquet(cache)
 
     all_rows, total, pn = [], 0, 1
-    while True:
-        rows, total = _fetch_page(pn, proxies=proxies)
+    max_pages = 200  # 全市场约 53 页，防死循环
+    while pn <= max_pages:
+        try:
+            rows, total = _fetch_page(pn, proxies=proxies)
+        except Exception as e:
+            print(f"  [资金流向] 第 {pn} 页失败: {e}，重试...")
+            time.sleep(2)
+            continue
         all_rows.extend(rows)
-        if len(all_rows) >= total or len(rows) < 100:
+        if len(all_rows) >= total or not rows:
             break
         pn += 1
         time.sleep(0.2)
@@ -76,6 +82,8 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     if not all_rows:
         print(f">>> 资金流向 {date_str}: 无数据")
         return pd.DataFrame()
+    if total and len(all_rows) < total:
+        print(f"⚠️ 资金流向 {date_str}: 仅拉到 {len(all_rows)}/{total} 只（不完整）")
 
     df = pd.DataFrame([{
         "trade_date": date_str,
@@ -93,6 +101,10 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     for col in ["main_net_amount", "super_net_amount", "big_net_amount",
                 "mid_net_amount", "small_net_amount", "main_net_ratio"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 不完整（远少于 total）不缓存，避免污染后续聚合
+    if total and len(df) < total * 0.9:
+        print(f"⚠️ 资金流向 {date_str} 数据不完整（{len(df)}/{total}），本次不缓存")
+        return df
     df.to_parquet(cache, index=False)
     print(f">>> 资金流向 {date_str}: {len(df)} 只 (total={total})")
     return df
