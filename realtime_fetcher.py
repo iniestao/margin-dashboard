@@ -64,17 +64,31 @@ def etf_secid(fund_code6: str) -> str:
     return f"1.{c}" if c.startswith(("5", "6")) else f"0.{c}"
 
 
+def _request_json(url: str, params: dict, proxies: dict | None, timeout: int) -> dict:
+    r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, proxies=proxies)
+    r.raise_for_status()
+    return r.json()
+
+
 def _ulist_get(secids: list[str], fields: str, proxies: dict | None = None,
                timeout: int = 30) -> list[dict]:
-    """调一次 ulist 接口，返回 diff 列表；失败抛异常（由上层降级）"""
-    url = URL_PUSH if proxies is None else URL_DELAY
+    """调一次 ulist 接口，返回 diff 列表；失败抛异常（由上层降级）。
+
+    域名自动降级：先 push2（云端直连），失败切 push2delay（本地代理/网络受限场景），
+    避免依赖 RT_PROXY 设置。
+    """
     params = {
         "fltt": "2", "invt": "2", "secids": ",".join(secids), "fields": fields,
         "ut": "b2884a393a59ad64002292a3e90d46a5",
     }
-    r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, proxies=proxies)
-    r.raise_for_status()
-    return (r.json().get("data") or {}).get("diff") or []
+    last_err = None
+    for url in (URL_PUSH, URL_DELAY):
+        try:
+            data = _request_json(url, params, proxies, timeout)
+            return (data.get("data") or {}).get("diff") or []
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 # ============================================================
