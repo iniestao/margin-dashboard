@@ -1,4 +1,4 @@
-"""A股资金监控看板 —— Tab1: A股指数融资额汇总 / Tab2: ETF份额监控"""
+"""A股资金监控看板 —— Tab1: 融资额 / Tab2: ETF份额监控 / Tab3: 资金流向 / Tab4: 实时行情"""
 
 import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 
@@ -8,15 +8,28 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from config import discover_all_indices, AGGREGATED_DIR, MARGIN_DIR
+from config import discover_all_indices, AGGREGATED_DIR, MARGIN_DIR, FOCUS_INDICES, FOCUS_NAMES
 from index_loader import load_index_weights
 from etf_fetcher import (load_etf_scale_cache as _load_etf_scale_cache,
                          load_etf_nav_cache as _load_etf_nav_cache,
                          compute_etf_amount,
                          NATIONAL_TEAM_ETF)
+from fund_flow_fetcher import load_fund_flow_cache
+from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime,
+                              index_secid, etf_secid, fetch_daily_amount_history,
+                              aggregate_flow_realtime, build_index_map, get_proxies,
+                              fetch_market_sentiment)
 
 st.set_page_config(page_title="A股资金监控看板", page_icon="💰", layout="wide", initial_sidebar_state="collapsed")
+
+# 实时行情参数
+REFRESH_MS = 60_000       # 自动刷新间隔（毫秒）
+VOLUME_RATIO = 1.3        # 放量阈值（实时成交额 / 基准 >= 该值标记放量）
+_BJ = ZoneInfo("Asia/Shanghai")
 
 # 中国A股配色
 RED, GREEN = "#E24B4A", "#22A45D"
@@ -334,6 +347,112 @@ def style_color(df: pd.DataFrame, cols: list):
     return fn(color_pct, subset=cols)
 
 
+# ============================================================
+#  实时行情：工具函数 + 限流加载（Tab4）
+# ============================================================
+
+def _now_bj() -> datetime:
+    return datetime.now(_BJ)
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    """交易日 9:30-11:30 / 13:00-15:00 视为盘中；周末停刷（节假日留后续精确判断）"""
+    now = now or _now_bj()
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 60 + now.minute
+    return (9 * 60 + 30 <= t <= 11 * 60 + 30) or (13 * 60 <= t <= 15 * 60)
+
+
+def _time_progress(now: datetime | None = None) -> float:
+    """当日已交易分钟 / 240（全天 240 分钟），用于放量基准折算；非交易时段返回 1.0"""
+    now = now or _now_bj()
+    if now.weekday() >= 5:
+        return 1.0
+    t = now.hour * 60 + now.minute
+    if 9 * 60 + 30 <= t <= 11 * 60 + 30:
+        return (t - (9 * 60 + 30)) / 240.0
+    if 13 * 60 <= t <= 15 * 60:
+        return (120 + (t - 13 * 60)) / 240.0
+    return 1.0
+
+
+@st.cache_data(ttl=3600)
+def load_ff_latest():
+    """最近已收盘交易日资金流快照（只取 trade_date.max() 一天），供实时 vs 昨日对比"""
+    ff = load_fund_flow_cache()
+    if ff.empty:
+        return pd.DataFrame()
+    last = ff["trade_date"].max()
+    return ff[ff["trade_date"] == last]
+
+
+@st.cache_data(ttl=3600)
+def build_index_map_cached():
+    """成分股集合（权重文件相对稳定，可用 cache_data）"""
+    return build_index_map(FOCUS_INDICES)
+
+
+def _aggregate_yesterday(ff_latest: pd.DataFrame, index_map: dict) -> dict:
+    """按指数聚合昨日快照主力净流入 → {index_code: 昨日主力净流入(元)}"""
+    if ff_latest is None or ff_latest.empty:
+        return {}
+    flow_map = dict(zip(ff_latest["stock_code"], ff_latest["main_net_amount"].fillna(0)))
+    yday = {}
+    for code, stocks in index_map.items():
+        vals = [flow_map.get(s) for s in stocks]
+        present = [v for v in vals if v is not None]
+        yday[code] = float(sum(present)) if present else 0.0
+    return yday
+
+
+def _realtime_load_all() -> dict:
+    """一次性拉取实时数据：指数行情 → 市场情绪 → 成分股资金流 → 内存聚合 → 昨日对比。
+
+    返回 dict: {ts, quotes, sentiment, flow, agg, yday, hist, error}
+    """
+    import time as _t
+    try:
+        index_map, all_codes = build_index_map_cached()
+        proxies = get_proxies()
+        quotes = fetch_index_quotes(FOCUS_INDICES, proxies=proxies)
+        flow = fetch_stock_flow_realtime(all_codes, proxies=proxies)
+        agg = aggregate_flow_realtime(flow, index_map)
+        yday = _aggregate_yesterday(load_ff_latest(), index_map)
+        # 放量基准：指数近 5 日成交额（当日 session 缓存一次，不重复拉）
+        if "rt_hist" not in st.session_state:
+            st.session_state["rt_hist"] = fetch_daily_amount_history(
+                [index_secid(c) for c in FOCUS_INDICES], proxies=proxies)
+        return {
+            "ts": _now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+            "quotes": quotes,
+            "sentiment": fetch_market_sentiment(quotes, proxies=proxies),
+            "flow": flow,
+            "agg": agg,
+            "yday": yday,
+            "hist": st.session_state.get("rt_hist", {}),
+            "error": None,
+        }
+    except Exception as e:
+        return {"ts": _now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+                "quotes": pd.DataFrame(), "sentiment": {}, "flow": pd.DataFrame(),
+                "agg": pd.DataFrame(), "yday": {}, "hist": {}, "error": str(e)}
+
+
+def rt_load() -> dict | None:
+    """限流拉取：距上次 >= REFRESH_MS 或不存在时重拉，否则复用 session_state（60s 内不重复请求）"""
+    import time as _t
+    now = _t.time()
+    if "rt_data" in st.session_state and now - st.session_state.get("rt_last_ts", 0) < REFRESH_MS / 1000:
+        return st.session_state["rt_data"]
+    with st.spinner("拉取实时行情..."):
+        data = _realtime_load_all()
+    if data is not None:
+        st.session_state["rt_data"] = data
+        st.session_state["rt_last_ts"] = now
+    return data
+
+
 # ── 全局样式 ──
 st.markdown("""
 <style>
@@ -379,7 +498,7 @@ if not etf_scale.empty and not etf_nav.empty:
 
 st.markdown("""<h1>A股资金监控看板</h1>""", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向"])
+tab1, tab2, tab3, tab4 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向", "实时行情"])
 
 # ============================================================
 #  Tab 1: A股指数融资额（原有全部内容）
@@ -937,8 +1056,145 @@ with tab3:
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
+# ============================================================
+#  Tab 4: 实时行情
+# ============================================================
+with tab4:
+    st.markdown("### 实时行情")
+    st.caption("数据源：东方财富实时接口（延迟数秒）；盘中自动刷新，非交易时段展示最近收盘数据")
+    auto = st.toggle("实时自动刷新（60 秒）", value=is_market_open(), key="rt_auto")
+    if auto:
+        st_autorefresh(interval=REFRESH_MS, key="rt_auto_refresh")
+    if not is_market_open():
+        st.caption("当前为非交易时段，自动刷新已暂停，展示最近数据")
+
+    rt = rt_load()
+    if rt is None or rt.get("error"):
+        st.warning(f"实时数据获取失败，请稍后刷新：{rt.get('error') if rt else '未知错误'}")
+    else:
+        ts, sent = rt["ts"], rt["sentiment"] or {}
+        quotes, agg, yday, hist = rt["quotes"], rt["agg"], rt["yday"], rt["hist"]
+
+        # ── 市场情绪指标卡 ──
+        c1, c2, c3, c4 = st.columns(4, gap="medium")
+        with c1:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">上涨家数</div>
+            <div class="metric-value" style="font-size:19px;color:{RED}">{sent.get('up', 0):,}</div>
+            <div class="metric-sub">全市场</div></div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">下跌家数</div>
+            <div class="metric-value" style="font-size:19px;color:{GREEN}">{sent.get('down', 0):,}</div>
+            <div class="metric-sub">全市场</div></div>""", unsafe_allow_html=True)
+        with c3:
+            dr = sent.get('up', 0) / max(sent.get('down', 0), 1)
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">涨跌比</div>
+            <div class="metric-value" style="font-size:19px">{dr:.2f}</div>
+            <div class="metric-sub">上涨/下跌</div></div>""", unsafe_allow_html=True)
+        with c4:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">两市成交额</div>
+            <div class="metric-value" style="font-size:19px">{sent.get('amount', 0)/1e8:,.0f}亿</div>
+            <div class="metric-sub">{ts}</div></div>""", unsafe_allow_html=True)
+
+        # ── 指数实时行情 + 放量提示 ──
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        st.markdown("### 指数实时行情")
+        if quotes.empty:
+            st.caption("暂无指数行情数据")
+        else:
+            q = quotes[quotes["code"].isin([c.split(".")[0] for c in FOCUS_INDICES])].copy()
+            if not q.empty:
+                q["指数"] = q["code"].map({c.split(".")[0]: FOCUS_NAMES.get(c, c) for c in FOCUS_INDICES})
+                q["点位"] = q["price"]
+                q["涨跌幅%"] = q["pct_chg"]
+                q["成交额(亿)"] = (q["amount"] / 1e8).round(0)
+                # 放量：实时成交额 vs 近5日同时段均值
+                prog = max(_time_progress(), 0.05)
+                q["量比"] = q.apply(lambda r: round(
+                    r["amount"] / (sum(hist.get(index_secid(r["code"]), [0])) / max(len(hist.get(index_secid(r["code"]), [0])), 1) * prog), 2)
+                    if hist.get(index_secid(r["code"])) and r["amount"] else None, axis=1)
+                q["放量"] = q["量比"].apply(lambda x: "放量" if x is not None and x >= VOLUME_RATIO else "")
+                tbl = q[["指数", "点位", "涨跌幅%", "成交额(亿)", "量比", "放量"]]
+                st.dataframe(style_color(tbl, ["涨跌幅%"]), use_container_width=True, hide_index=True,
+                             column_config={
+                                 "点位": st.column_config.NumberColumn(format="%.2f"),
+                                 "涨跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                 "成交额(亿)": st.column_config.NumberColumn(format="%.0f"),
+                                 "量比": st.column_config.NumberColumn(format="%.2f"),
+                             })
+
+        # ── 指数成分股主力净流入实时排行 + vs 昨日 ──
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        st.markdown("### 指数成分股主力净流入（实时）")
+        if agg.empty:
+            st.caption("暂无实时资金流数据（非交易时段接口可能为空）")
+        else:
+            name_map = {c: FOCUS_NAMES.get(c, c) for c in FOCUS_INDICES}
+            a = agg.copy()
+            a["指数"] = a["index_code"].map(name_map)
+            a["实时主力(亿)"] = (a["main_net"] / 1e8).round(2)
+            a["昨日主力(亿)"] = a["index_code"].map(lambda c: round(yday.get(c, 0) / 1e8, 2))
+            a["边际(亿)"] = (a["实时主力(亿)"] - a["昨日主力(亿)"]).round(2)
+            a = a.sort_values("实时主力(亿)", ascending=False)
+
+            fc1, fc2 = st.columns(2, gap="medium")
+            for col, data, label, icon in [(fc1, a.head(5), "净流入 TOP5", "📈"),
+                                           (fc2, a.tail(5).iloc[::-1], "净流出 TOP5", "📉")]:
+                with col:
+                    st.caption(f"{icon} {label}")
+                    for _, r in data.iterrows():
+                        v, m = r["实时主力(亿)"], r["边际(亿)"]
+                        st.markdown(f"""
+                        <div class="rank-card">
+                            <div class="rank-title">{r['指数']}
+                                <span class="rank-badge" style="color:{pct_color(v)}">{v:+.2f}亿</span>
+                            </div>
+                            <div class="rank-meta">昨日 {r['昨日主力(亿)']:+.2f}亿 · 边际 <span style="color:{pct_color(m)}">{m:+.2f}亿</span></div>
+                        </div>""", unsafe_allow_html=True)
+
+            with st.expander(f"查看全部 {len(a)} 个指数实时资金流"):
+                fc = ["指数", "实时主力(亿)", "昨日主力(亿)", "边际(亿)"]
+                st.dataframe(style_color(a[fc], fc[1:]), use_container_width=True, hide_index=True,
+                             column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in fc[1:]})
+            st.caption("注：实时为盘中估算；对比的\"昨日\"为最近已收盘交易日快照，权威记录以日更数据为准")
+
+        # ── 国家队 ETF 实时行情（懒加载）──
+        with st.expander("国家队 ETF 实时行情（可勾选查看）"):
+            etf_labels = [f"{c} {NATIONAL_TEAM_ETF[c]}" for c in NATIONAL_TEAM_ETF]
+            sel = st.multiselect("选择 ETF（默认不选，勾选后拉取实时数据）", etf_labels,
+                                 default=[], key="rt_etf_sel")
+            if sel:
+                codes = [l.split(" ")[0] for l in sel]
+                with st.spinner("拉取 ETF 实时行情..."):
+                    e_flow = fetch_stock_flow_realtime(codes, proxies=get_proxies())
+                    e_hist = fetch_daily_amount_history([etf_secid(c) for c in codes],
+                                                        proxies=get_proxies())
+                if e_flow.empty:
+                    st.caption("ETF 实时数据为空")
+                else:
+                    e = e_flow.copy()
+                    e["ETF"] = e["stock_code"].map(NATIONAL_TEAM_ETF).fillna(e["stock_name"])
+                    e["最新价"] = e["price"]
+                    e["涨跌幅%"] = e["pct_chg"]
+                    e["成交额(亿)"] = (e["amount"] / 1e8).round(2)
+                    e["主力净流入(亿)"] = (e["main_net_amount"] / 1e8).round(2)
+                    prog = max(_time_progress(), 0.05)
+                    e["量比"] = e.apply(lambda r: round(
+                        r["amount"] / (sum(e_hist.get(etf_secid(r["stock_code"]), [0])) / max(len(e_hist.get(etf_secid(r["stock_code"]), [0])), 1) * prog), 2)
+                        if e_hist.get(etf_secid(r["stock_code"])) and r["amount"] else None, axis=1)
+                    e["放量"] = e["量比"].apply(lambda x: "放量" if x is not None and x >= VOLUME_RATIO else "")
+                    et = e[["ETF", "最新价", "涨跌幅%", "成交额(亿)", "主力净流入(亿)", "量比", "放量"]]
+                    st.dataframe(style_color(et, ["涨跌幅%", "主力净流入(亿)"]),
+                                 use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "最新价": st.column_config.NumberColumn(format="%.3f"),
+                                     "涨跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                     "成交额(亿)": st.column_config.NumberColumn(format="%.2f"),
+                                     "主力净流入(亿)": st.column_config.NumberColumn(format="%+.2f"),
+                                     "量比": st.column_config.NumberColumn(format="%.2f"),
+                                 })
+
 st.markdown("""
 <div style='text-align:center;padding:32px 0 16px 0;color:#bbb;font-size:11px;border-top:1px solid #eee;margin-top:32px'>
-    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向
+    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向 · 实时行情
 </div>
 """, unsafe_allow_html=True)
