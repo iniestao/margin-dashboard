@@ -20,7 +20,7 @@ from etf_fetcher import (load_etf_scale_cache as _load_etf_scale_cache,
                          NATIONAL_TEAM_ETF)
 from fund_flow_fetcher import load_fund_flow_cache
 from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime,
-                              index_secid, etf_secid, fetch_daily_amount_history,
+                              index_secid, fetch_daily_amount_history,
                               aggregate_flow_realtime, build_index_map, get_proxies,
                               fetch_market_sentiment)
 
@@ -389,8 +389,9 @@ def load_ff_latest():
 
 @st.cache_data(ttl=3600)
 def build_index_map_cached():
-    """成分股集合（权重文件相对稳定，可用 cache_data）"""
-    return build_index_map(FOCUS_INDICES)
+    """成分股集合（全部约 147 个指数，权重文件相对稳定，可用 cache_data）"""
+    all_indices = [c for c, _ in discover_all_indices()]
+    return build_index_map(all_indices)
 
 
 def _aggregate_yesterday(ff_latest: pd.DataFrame, index_map: dict) -> dict:
@@ -1122,19 +1123,21 @@ with tab4:
                                  "量比": st.column_config.NumberColumn(format="%.2f"),
                              })
 
-        # ── 指数成分股主力净流入实时排行 + vs 昨日 ──
+        # ── 指数成分股实时资金流排行（全部指数，主力/中单/小单） + vs 昨日 ──
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-        st.markdown("### 指数成分股主力净流入（实时）")
+        st.markdown("### 指数成分股资金流向（实时）")
         if agg.empty:
             st.caption("暂无实时资金流数据（非交易时段接口可能为空）")
         else:
-            name_map = {c: FOCUS_NAMES.get(c, c) for c in FOCUS_INDICES}
+            name_map = dict(discover_all_indices())   # 全部指数名称（内部已含宽基名）
             a = agg.copy()
-            a["指数"] = a["index_code"].map(name_map)
-            a["实时主力(亿)"] = (a["main_net"] / 1e8).round(2)
+            a["指数"] = a["index_code"].map(lambda c: name_map.get(c, c))
+            a["主力(亿)"] = (a["main_net"] / 1e8).round(2)
+            a["中单(亿)"] = (a["mid_net"] / 1e8).round(2)
+            a["小单(亿)"] = (a["small_net"] / 1e8).round(2)
             a["昨日主力(亿)"] = a["index_code"].map(lambda c: round(yday.get(c, 0) / 1e8, 2))
-            a["边际(亿)"] = (a["实时主力(亿)"] - a["昨日主力(亿)"]).round(2)
-            a = a.sort_values("实时主力(亿)", ascending=False)
+            a["边际(亿)"] = (a["主力(亿)"] - a["昨日主力(亿)"]).round(2)
+            a = a.sort_values("主力(亿)", ascending=False)
 
             fc1, fc2 = st.columns(2, gap="medium")
             for col, data, label, icon in [(fc1, a.head(5), "净流入 TOP5", "📈"),
@@ -1142,56 +1145,22 @@ with tab4:
                 with col:
                     st.caption(f"{icon} {label}")
                     for _, r in data.iterrows():
-                        v, m = r["实时主力(亿)"], r["边际(亿)"]
+                        v, mid, sm = r["主力(亿)"], r["中单(亿)"], r["小单(亿)"]
+                        y, delta = r["昨日主力(亿)"], r["边际(亿)"]
                         st.markdown(f"""
                         <div class="rank-card">
                             <div class="rank-title">{r['指数']}
                                 <span class="rank-badge" style="color:{pct_color(v)}">{v:+.2f}亿</span>
                             </div>
-                            <div class="rank-meta">昨日 {r['昨日主力(亿)']:+.2f}亿 · 边际 <span style="color:{pct_color(m)}">{m:+.2f}亿</span></div>
+                            <div class="rank-meta">中单 {mid:+.2f}亿 · 小单 {sm:+.2f}亿</div>
+                            <div class="rank-meta">昨日 {y:+.2f}亿 · 边际 <span style="color:{pct_color(delta)}">{delta:+.2f}亿</span></div>
                         </div>""", unsafe_allow_html=True)
 
             with st.expander(f"查看全部 {len(a)} 个指数实时资金流"):
-                fc = ["指数", "实时主力(亿)", "昨日主力(亿)", "边际(亿)"]
+                fc = ["指数", "主力(亿)", "中单(亿)", "小单(亿)", "昨日主力(亿)", "边际(亿)"]
                 st.dataframe(style_color(a[fc], fc[1:]), use_container_width=True, hide_index=True,
                              column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in fc[1:]})
             st.caption("注：实时为盘中估算；对比的\"昨日\"为最近已收盘交易日快照，权威记录以日更数据为准")
-
-        # ── 国家队 ETF 实时行情（懒加载）──
-        with st.expander("国家队 ETF 实时行情（可勾选查看）"):
-            etf_labels = [f"{c} {NATIONAL_TEAM_ETF[c]}" for c in NATIONAL_TEAM_ETF]
-            sel = st.multiselect("选择 ETF（默认不选，勾选后拉取实时数据）", etf_labels,
-                                 default=[], key="rt_etf_sel")
-            if sel:
-                codes = [l.split(" ")[0] for l in sel]
-                with st.spinner("拉取 ETF 实时行情..."):
-                    e_flow = fetch_stock_flow_realtime(codes, proxies=get_proxies())
-                    e_hist = fetch_daily_amount_history([etf_secid(c) for c in codes],
-                                                        proxies=get_proxies())
-                if e_flow.empty:
-                    st.caption("ETF 实时数据为空")
-                else:
-                    e = e_flow.copy()
-                    e["ETF"] = e["stock_code"].map(NATIONAL_TEAM_ETF).fillna(e["stock_name"])
-                    e["最新价"] = e["price"]
-                    e["涨跌幅%"] = e["pct_chg"]
-                    e["成交额(亿)"] = (e["amount"] / 1e8).round(2)
-                    e["主力净流入(亿)"] = (e["main_net_amount"] / 1e8).round(2)
-                    prog = max(_time_progress(), 0.05)
-                    e["量比"] = e.apply(lambda r: round(
-                        r["amount"] / (sum(e_hist.get(etf_secid(r["stock_code"]), [0])) / max(len(e_hist.get(etf_secid(r["stock_code"]), [0])), 1) * prog), 2)
-                        if e_hist.get(etf_secid(r["stock_code"])) and r["amount"] else None, axis=1)
-                    e["放量"] = e["量比"].apply(lambda x: "放量" if x is not None and x >= VOLUME_RATIO else "")
-                    et = e[["ETF", "最新价", "涨跌幅%", "成交额(亿)", "主力净流入(亿)", "量比", "放量"]]
-                    st.dataframe(style_color(et, ["涨跌幅%", "主力净流入(亿)"]),
-                                 use_container_width=True, hide_index=True,
-                                 column_config={
-                                     "最新价": st.column_config.NumberColumn(format="%.3f"),
-                                     "涨跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
-                                     "成交额(亿)": st.column_config.NumberColumn(format="%.2f"),
-                                     "主力净流入(亿)": st.column_config.NumberColumn(format="%+.2f"),
-                                     "量比": st.column_config.NumberColumn(format="%.2f"),
-                                 })
 
 st.markdown("""
 <div style='text-align:center;padding:32px 0 16px 0;color:#bbb;font-size:11px;border-top:1px solid #eee;margin-top:32px'>

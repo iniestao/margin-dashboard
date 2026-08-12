@@ -25,7 +25,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Referer": "https://data.eastmoney.com/",
 }
-BATCH_SIZE = 300
+BATCH_SIZE = 400  # 每批 secids 上限（实测 300 只约 1.1s；400 批约 4495 只成分股 / 12 批）
 FIELDS_QUOTE = "f2,f3,f6,f12,f13,f14,f104,f105"
 FIELDS_FLOW = "f2,f3,f6,f12,f14,f62,f66,f72,f78,f84,f184"
 RT_PROXY_ENV = "RT_PROXY"
@@ -251,25 +251,33 @@ def build_index_map(index_codes: list[str]) -> tuple[dict, list[str]]:
 
 
 def aggregate_flow_realtime(flow_df: pd.DataFrame, index_map: dict) -> pd.DataFrame:
-    """按指数维度聚合实时主力净流入（内存 dict 求和，不做历史 merge）。
+    """按指数维度聚合实时 主力/中单/小单 净流入（内存 dict 求和，不做历史 merge）。
 
     flow_df: fetch_stock_flow_realtime 结果
     index_map: {index_code: [6位成分股]}
 
     返回 DataFrame 列：
-        index_code, main_net(元), stock_count(有数据成分股数)
+        index_code, main_net(元), mid_net(元), small_net(元), stock_count(有数据成分股数)
     """
     if flow_df is None or flow_df.empty:
         return pd.DataFrame()
-    flow_map = dict(zip(flow_df["stock_code"], flow_df["main_net_amount"].fillna(0)))
+    main_map = dict(zip(flow_df["stock_code"], flow_df["main_net_amount"].fillna(0)))
+    mid_map = dict(zip(flow_df["stock_code"], flow_df["mid_net_amount"].fillna(0)))
+    small_map = dict(zip(flow_df["stock_code"], flow_df["small_net_amount"].fillna(0)))
     rows = []
     for code, stocks in index_map.items():
-        vals = [flow_map.get(s) for s in stocks]
-        present = [v for v in vals if v is not None]
+        m = [main_map.get(s) for s in stocks]
+        md = [mid_map.get(s) for s in stocks]
+        sm = [small_map.get(s) for s in stocks]
+        pm = [v for v in m if v is not None]
+        p_mid = [v for v in md if v is not None]
+        p_sm = [v for v in sm if v is not None]
         rows.append({
             "index_code": code,
-            "main_net": float(sum(present)) if present else 0.0,
-            "stock_count": len(present),
+            "main_net": float(sum(pm)) if pm else 0.0,
+            "mid_net": float(sum(p_mid)) if p_mid else 0.0,
+            "small_net": float(sum(p_sm)) if p_sm else 0.0,
+            "stock_count": len(pm),
         })
     return pd.DataFrame(rows)
 
