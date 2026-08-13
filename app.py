@@ -433,7 +433,10 @@ def _realtime_load_all() -> dict:
         quotes = fetch_index_quotes(FOCUS_INDICES, proxies=proxies)
         flow = fetch_stock_flow_realtime(all_codes, proxies=proxies)
         agg = aggregate_flow_realtime(flow, index_map)
-        yday = _aggregate_yesterday(load_ff_latest(), index_map)
+        ff_latest = load_ff_latest()   # 只读一次：供指数级 + 成分股级昨日对比复用
+        yday = _aggregate_yesterday(ff_latest, index_map)
+        yday_stock = (dict(zip(ff_latest["stock_code"], ff_latest["main_net_amount"].fillna(0)))
+                      if (ff_latest is not None and not ff_latest.empty) else {})
         # 放量基准：指数近 5 日成交额（当日 session 缓存一次，不重复拉）；含两市指数供成交额对比
         if "rt_hist" not in st.session_state:
             st.session_state["rt_hist"] = fetch_daily_amount_history(
@@ -446,13 +449,16 @@ def _realtime_load_all() -> dict:
             "flow": flow,
             "agg": agg,
             "yday": yday,
+            "yday_stock": yday_stock,
             "hist": st.session_state.get("rt_hist", {}),
+            "index_map": index_map,
             "error": None,
         }
     except Exception as e:
         return {"ts": _now_bj().strftime("%Y-%m-%d %H:%M:%S"),
                 "quotes": pd.DataFrame(), "sentiment": {}, "flow": pd.DataFrame(),
-                "agg": pd.DataFrame(), "yday": {}, "hist": {}, "error": str(e)}
+                "agg": pd.DataFrame(), "yday": {}, "yday_stock": {},
+                "hist": {}, "index_map": {}, "error": str(e)}
 
 
 def rt_load() -> dict | None:
@@ -1212,6 +1218,47 @@ with tab4:
                     fc = ["指数", "主力(亿)", "中单(亿)", "小单(亿)", "昨日主力(亿)", "边际(亿)"]
                     st.dataframe(style_color(a_search[fc], fc[1:]), use_container_width=True, hide_index=True,
                                  column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in fc[1:]})
+
+            # ── 成分股实时下钻（选择指数查看成分股实时资金流明细，平铺展示）──
+            st.markdown("#### 成分股实时资金流明细")
+            index_map_rt = rt.get("index_map") or {}
+            flow_rt = rt.get("flow")
+            if flow_rt is None or flow_rt.empty:
+                flow_rt = pd.DataFrame()
+            yday_stock = rt.get("yday_stock") or {}
+            if not index_map_rt or flow_rt.empty:
+                st.caption("暂无实时数据（非交易时段接口可能为空）")
+            else:
+                drill_labels = [f"{c} {name_map.get(c, c)}" for c in a["index_code"]]
+                sel_idx = st.selectbox("选择指数", drill_labels, key="rt_drill_idx")
+                sel_code = sel_idx.split(" ")[0]
+                stocks = index_map_rt.get(sel_code, [])
+                sub = flow_rt[flow_rt["stock_code"].isin(stocks)].copy()
+                if sub.empty:
+                    st.caption(f"{sel_idx} 暂无成分股实时数据")
+                else:
+                    sub["名称"] = sub["stock_name"].fillna("")
+                    sub["最新价"] = sub["price"]
+                    sub["涨跌幅%"] = sub["pct_chg"]
+                    sub["主力(万)"] = (sub["main_net_amount"] / 1e4).round(0)
+                    sub["昨日主力(万)"] = (sub["stock_code"].map(lambda c: yday_stock.get(c, 0)) / 1e4).round(0)
+                    sub["边际(万)"] = ((sub["main_net_amount"] - sub["stock_code"].map(lambda c: yday_stock.get(c, 0))) / 1e4).round(0)
+                    sub["中单(万)"] = (sub["mid_net_amount"] / 1e4).round(0)
+                    sub["小单(万)"] = (sub["small_net_amount"] / 1e4).round(0)
+                    sub = sub.sort_values("main_net_amount", ascending=False)
+                    dc = ["stock_code", "名称", "最新价", "涨跌幅%", "主力(万)", "昨日主力(万)",
+                          "边际(万)", "中单(万)", "小单(万)"]
+                    st.caption(f"{sel_idx} · {len(sub)} 只成分股 · 按主力净流入降序")
+                    st.dataframe(style_color(sub[dc], dc[4:]), use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "最新价": st.column_config.NumberColumn(format="%.2f"),
+                                     "涨跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                     "主力(万)": st.column_config.NumberColumn(format="%+.0f"),
+                                     "昨日主力(万)": st.column_config.NumberColumn(format="%+.0f"),
+                                     "边际(万)": st.column_config.NumberColumn(format="%+.0f"),
+                                     "中单(万)": st.column_config.NumberColumn(format="%+.0f"),
+                                     "小单(万)": st.column_config.NumberColumn(format="%+.0f"),
+                                 })
             st.caption("注：实时为盘中估算；对比的\"昨日\"为最近已收盘交易日快照，权威记录以日更数据为准")
 
 st.markdown("""
