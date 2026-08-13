@@ -21,6 +21,7 @@ from etf_fetcher import (load_etf_scale_cache as _load_etf_scale_cache,
 from fund_flow_fetcher import load_fund_flow_cache
 from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime,
                               index_secid, fetch_daily_amount_history,
+                              fetch_index_kline_close,
                               aggregate_flow_realtime, build_index_map, get_proxies,
                               fetch_market_sentiment)
 
@@ -407,6 +408,19 @@ def _aggregate_yesterday(ff_latest: pd.DataFrame, index_map: dict) -> dict:
     return yday
 
 
+def load_ssindex_close() -> pd.DataFrame:
+    """上证指数日线收盘（session_state 当日缓存一次，与 rt_hist 模式一致）。
+
+    注：app.py 顶部每次 rerun 清 st.cache_data，故不可用 cache_data；失败也缓存空表避免反复请求。
+    """
+    if "ssindex_close" in st.session_state:
+        return st.session_state["ssindex_close"]
+    proxies = get_proxies()
+    df = fetch_index_kline_close(index_secid("000001.SH"), days=500, proxies=proxies)
+    st.session_state["ssindex_close"] = df   # 失败也缓存（空表），与 rt_hist 一致
+    return df
+
+
 def _realtime_load_all() -> dict:
     """一次性拉取实时数据：指数行情 → 市场情绪 → 成分股资金流 → 内存聚合 → 昨日对比。
 
@@ -420,10 +434,11 @@ def _realtime_load_all() -> dict:
         flow = fetch_stock_flow_realtime(all_codes, proxies=proxies)
         agg = aggregate_flow_realtime(flow, index_map)
         yday = _aggregate_yesterday(load_ff_latest(), index_map)
-        # 放量基准：指数近 5 日成交额（当日 session 缓存一次，不重复拉）
+        # 放量基准：指数近 5 日成交额（当日 session 缓存一次，不重复拉）；含两市指数供成交额对比
         if "rt_hist" not in st.session_state:
             st.session_state["rt_hist"] = fetch_daily_amount_history(
-                [index_secid(c) for c in FOCUS_INDICES], proxies=proxies)
+                [index_secid(c) for c in FOCUS_INDICES] + ["1.000001", "0.399106"],
+                proxies=proxies)
         return {
             "ts": _now_bj().strftime("%Y-%m-%d %H:%M:%S"),
             "quotes": quotes,
@@ -535,7 +550,7 @@ with tab1:
             <div class="metric-value" style="font-size:19px">{buy_txt}</div>
             <div class="metric-sub">{latest_str}</div></div>""", unsafe_allow_html=True)
 
-        # 全市场融资余额历史曲线 + 每日买入额（副轴）
+        # 全市场融资余额历史曲线 + 每日买入额（副轴）+ 上证指数（第三轴）
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(go.Scatter(
             x=daily.index, y=daily["total_balance"] / 1e8,
@@ -547,6 +562,18 @@ with tab1:
             name="每日融资买入额", marker_color="rgba(226,74,74,0.30)",
             hovertemplate="%{x|%Y-%m-%d}<br>买入 %{y:,.0f}亿<extra></extra>",
         ), secondary_y=True)
+        # ── 上证指数收盘叠加（第三轴 y3，与 y2 右轴错开不重叠）──
+        ss_series = None
+        ss_close = load_ssindex_close()
+        if ss_close is not None and not ss_close.empty:
+            ss_series = ss_close.set_index("date")["close"].reindex(daily.index)
+        if ss_series is not None and ss_series.notna().any():
+            fig.add_trace(go.Scatter(
+                x=ss_series.index, y=ss_series.values,
+                name="上证指数", line=dict(width=1.3, color="#FFA940"),
+                yaxis="y3",
+                hovertemplate="%{x|%Y-%m-%d}<br>上证 %{y:,.1f}<extra></extra>",
+            ))
         fig.update_layout(
             height=360, margin=dict(l=0, r=0, t=0, b=0), bargap=0.4,
             legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center",
@@ -557,7 +584,11 @@ with tab1:
             yaxis=dict(title="融资余额(亿元)", showgrid=True, gridcolor="#f0f0f0",
                        showline=False, tickfont=dict(size=11, color="#888")),
             yaxis2=dict(title="买入额(亿元)", showgrid=False, showline=False,
-                        tickfont=dict(size=11, color="#AAA")),
+                        tickfont=dict(size=11, color="#AAA"),
+                        overlaying="y", side="right", position=1.0, anchor="free"),
+            yaxis3=dict(title="上证指数", showgrid=False, showline=False,
+                        tickfont=dict(size=11, color="#AAA"),
+                        overlaying="y", side="right", position=0.86, anchor="free"),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Microsoft YaHei, PingFang SC, sans-serif"),
         )
@@ -1092,9 +1123,19 @@ with tab4:
             <div class="metric-value" style="font-size:19px">{dr:.2f}</div>
             <div class="metric-sub">上涨/下跌</div></div>""", unsafe_allow_html=True)
         with c4:
+            cur_amt = float(sent.get("amount", 0) or 0)
+            h1, h2 = hist.get("1.000001", []) or [], hist.get("0.399106", []) or []
+            if cur_amt > 0 and len(h1) >= 2 and len(h2) >= 2:
+                y_same = (h1[-2] + h2[-2]) * _time_progress()   # 昨日两市成交额 × 当日时间进度
+                diff = (cur_amt - y_same) / 1e8
+                cmp_txt = f"较昨日同时段 {diff:+,.0f}亿"
+                cmp_color = pct_color(diff)      # 放量红 / 缩量绿
+            else:
+                cmp_txt, cmp_color = "较昨日同时段 -", "#AAA"
             st.markdown(f"""<div class="metric-card"><div class="metric-label">两市成交额</div>
-            <div class="metric-value" style="font-size:19px">{sent.get('amount', 0)/1e8:,.0f}亿</div>
-            <div class="metric-sub">{ts}</div></div>""", unsafe_allow_html=True)
+            <div class="metric-value" style="font-size:19px">{cur_amt/1e8:,.0f}亿</div>
+            <div class="metric-sub" style="line-height:1.7">{ts}
+            <div style="color:{cmp_color}">{cmp_txt}</div></div></div>""", unsafe_allow_html=True)
 
         # ── 指数实时行情 + 放量提示 ──
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
@@ -1126,6 +1167,8 @@ with tab4:
         # ── 指数成分股实时资金流排行（全部指数，主力/中单/小单） + vs 昨日 ──
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
         st.markdown("### 指数成分股资金流向（实时）")
+        kw = st.text_input("搜索指数", key="rt_search",
+                           placeholder="输入指数名称或代码，如 沪深300 / 000300").strip()
         if agg.empty:
             st.caption("暂无实时资金流数据（非交易时段接口可能为空）")
         else:
@@ -1138,6 +1181,12 @@ with tab4:
             a["昨日主力(亿)"] = a["index_code"].map(lambda c: round(yday.get(c, 0) / 1e8, 2))
             a["边际(亿)"] = (a["主力(亿)"] - a["昨日主力(亿)"]).round(2)
             a = a.sort_values("主力(亿)", ascending=False)
+            # ── 搜索过滤：仅作用于展开表格；TOP 卡片保持全量 a ──
+            if kw:
+                a_search = a[a["指数"].str.contains(kw, case=False, na=False, regex=False)
+                            | a["index_code"].str.contains(kw, case=False, na=False, regex=False)]
+            else:
+                a_search = a
 
             fc1, fc2 = st.columns(2, gap="medium")
             for col, data, label, icon in [(fc1, a.head(5), "净流入 TOP5", "📈"),
@@ -1156,10 +1205,13 @@ with tab4:
                             <div class="rank-meta">昨日 {y:+.2f}亿 · 边际 <span style="color:{pct_color(delta)}">{delta:+.2f}亿</span></div>
                         </div>""", unsafe_allow_html=True)
 
-            with st.expander(f"查看全部 {len(a)} 个指数实时资金流"):
-                fc = ["指数", "主力(亿)", "中单(亿)", "小单(亿)", "昨日主力(亿)", "边际(亿)"]
-                st.dataframe(style_color(a[fc], fc[1:]), use_container_width=True, hide_index=True,
-                             column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in fc[1:]})
+            if a_search.empty:
+                st.caption("未找到匹配指数")
+            else:
+                with st.expander(f"查看全部 {len(a)} 个指数实时资金流（匹配 {len(a_search)} 个）"):
+                    fc = ["指数", "主力(亿)", "中单(亿)", "小单(亿)", "昨日主力(亿)", "边际(亿)"]
+                    st.dataframe(style_color(a_search[fc], fc[1:]), use_container_width=True, hide_index=True,
+                                 column_config={c: st.column_config.NumberColumn(format="%+.2f") for c in fc[1:]})
             st.caption("注：实时为盘中估算；对比的\"昨日\"为最近已收盘交易日快照，权威记录以日更数据为准")
 
 st.markdown("""

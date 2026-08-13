@@ -224,6 +224,38 @@ def fetch_daily_amount_history(secids: list[str], days: int = 5,
     return result
 
 
+def fetch_index_kline_close(secid: str, days: int = 500,
+                            proxies: dict | None = None) -> pd.DataFrame:
+    """拉指数日线收盘点位（复用 kline/get 接口，用于 Tab1 叠加上证指数走势）。
+
+    返回 DataFrame(date(datetime, 旧→新), close(float))；失败返回空 DataFrame(columns=["date","close"])。
+    """
+    params = {
+        "secid": secid, "klt": "101", "fqt": "0",
+        "beg": "0", "end": "20500101", "lmt": str(days),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+    }
+    try:
+        r = requests.get(URL_KLINE, params=params, headers=HEADERS, timeout=20, proxies=proxies)
+        klines = ((r.json().get("data") or {}).get("klines")) or []
+        rows = []
+        for line in klines:
+            parts = line.split(",")          # 日期,开,收,高,低,成交量,成交额,...
+            if len(parts) < 3:
+                continue
+            d = pd.to_datetime(parts[0], errors="coerce")   # "YYYY-MM-DD"
+            c = pd.to_numeric(parts[2], errors="coerce")    # 收盘点位
+            if pd.notna(d) and pd.notna(c):
+                rows.append((d, c))
+        return (pd.DataFrame(rows, columns=["date", "close"])
+                  .sort_values("date").reset_index(drop=True))
+    except Exception as e:
+        print(f"  [指数K线] {secid} 失败: {e}")
+        return pd.DataFrame(columns=["date", "close"])
+
+
 # ============================================================
 #  成分股集合 + 实时聚合（内存，不落盘）
 # ============================================================
