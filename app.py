@@ -603,7 +603,7 @@ with tab1:
             <div class="metric-value" style="font-size:19px">{buy_txt}</div>
             <div class="metric-sub">{latest_str}</div></div>""", unsafe_allow_html=True)
 
-        # 全市场融资余额历史曲线 + 每日买入额（副轴）+ 上证指数（第三轴）
+        # 全市场融资余额历史曲线 + 每日买入额（副轴）+ 上证指数（主轴，红色）
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(go.Scatter(
             x=daily.index, y=daily["total_balance"] / 1e8,
@@ -615,7 +615,7 @@ with tab1:
             name="每日融资买入额", marker_color="rgba(226,74,74,0.30)",
             hovertemplate="%{x|%Y-%m-%d}<br>买入 %{y:,.0f}亿<extra></extra>",
         ), secondary_y=True)
-        # ── 上证指数收盘叠加（第三轴 y3，与 y2 右轴错开不重叠）──
+        # ── 上证指数收盘叠加（沿用主轴 y，红色，不加新坐标轴）──
         ss_series = None
         ss_close = load_ssindex_close()
         if ss_close is not None and not ss_close.empty:
@@ -623,8 +623,7 @@ with tab1:
         if ss_series is not None and ss_series.notna().any():
             fig.add_trace(go.Scatter(
                 x=ss_series.index, y=ss_series.values,
-                name="上证指数", line=dict(width=1.3, color="#FFA940"),
-                yaxis="y3",
+                name="上证指数", line=dict(width=1.6, color=RED),
                 hovertemplate="%{x|%Y-%m-%d}<br>上证 %{y:,.1f}<extra></extra>",
             ))
         fig.update_layout(
@@ -638,10 +637,7 @@ with tab1:
                        showline=False, tickfont=dict(size=11, color="#888")),
             yaxis2=dict(title="买入额(亿元)", showgrid=False, showline=False,
                         tickfont=dict(size=11, color="#AAA"),
-                        overlaying="y", side="right", position=1.0, anchor="free"),
-            yaxis3=dict(title="上证指数", showgrid=False, showline=False,
-                        tickfont=dict(size=11, color="#AAA"),
-                        overlaying="y", side="right", position=0.86, anchor="free"),
+                        overlaying="y", side="right"),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Microsoft YaHei, PingFang SC, sans-serif"),
         )
