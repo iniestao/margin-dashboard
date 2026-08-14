@@ -1197,11 +1197,11 @@ def _render_realtime_content(rt: dict):
             q["点位"] = q["price"]
             q["涨跌幅%"] = q["pct_chg"]
             q["成交额(亿)"] = (q["amount"] / 1e8).round(0)
-            # 量比（成交量口径）：实时成交量(手) vs 近5日同时段均值(手)
+            # 量比（较昨日同时段）：实时成交量(手) vs 昨日全天成交量 × 当日进度
             prog = max(_time_progress(), 0.05)
             q["量比"] = q.apply(lambda r: round(
-                r["volume"] / (sum(hist.get(index_secid(r["code"]), [0])) / max(len(hist.get(index_secid(r["code"]), [0])), 1) * prog), 2)
-                if hist.get(index_secid(r["code"])) and r["volume"] else None, axis=1)
+                r["volume"] / (hist.get(index_secid(r["code"]), [0])[-2] * prog), 2)
+                if hist.get(index_secid(r["code"])) and len(hist.get(index_secid(r["code"]), [])) >= 2 and r["volume"] else None, axis=1)
             q["放量"] = q["量比"].apply(lambda x: "放量" if x is not None and x >= VOLUME_RATIO else "")
             tbl = q[["指数", "点位", "涨跌幅%", "成交额(亿)", "量比", "放量"]]
             st.dataframe(style_color(tbl, ["涨跌幅%"]), use_container_width=True, hide_index=True,
