@@ -216,7 +216,9 @@ def compute_etf_changes_multi(etf_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values("20日变化%", ascending=False, na_position="last")
+    # 历史不足时可能缺 20日列：按存在的列排序（优先 20→5→1）
+    sort_col = next((c for c in ["20日变化%", "5日变化%", "1日变化%"] if c in out.columns), out.columns[0])
+    return out.sort_values(sort_col, ascending=False, na_position="last")
 
 
 def compute_nt_pool_stats(etf_df: pd.DataFrame, codes: list, value_col: str = "total_share") -> dict:
@@ -424,15 +426,27 @@ def _aggregate_yesterday(ff_latest: pd.DataFrame, index_map: dict) -> dict:
 
 
 def load_ssindex_close() -> pd.DataFrame:
-    """上证指数日线收盘（session_state 当日缓存一次，与 rt_hist 模式一致）。
+    """上证指数日线收盘（session_state 当日缓存一次）。
 
+    优先东财 kline；失败（如云端 push2his 不通）降级 akshare 拉上证指数日线。
     注：app.py 顶部每次 rerun 清 st.cache_data，故不可用 cache_data；失败也缓存空表避免反复请求。
     """
     if "ssindex_close" in st.session_state:
         return st.session_state["ssindex_close"]
     proxies = get_proxies()
     df = fetch_index_kline_close(index_secid("000001.SH"), days=500, proxies=proxies)
-    st.session_state["ssindex_close"] = df   # 失败也缓存（空表），与 rt_hist 一致
+    if df.empty:
+        # 降级：akshare 上证指数日线（接口更稳定，云端可达）
+        try:
+            import akshare as ak
+            k = ak.stock_zh_index_daily(symbol="sh000001")
+            if not k.empty:
+                k = k.rename(columns={"date": "date", "close": "close"})
+                k["date"] = pd.to_datetime(k["date"], errors="coerce")
+                df = k[["date", "close"]].dropna().sort_values("date").reset_index(drop=True)
+        except Exception as e:
+            print(f"  [上证指数] akshare 降级失败: {e}")
+    st.session_state["ssindex_close"] = df   # 失败也缓存（空表），避免反复请求
     return df
 
 
@@ -1297,7 +1311,9 @@ def render_realtime_tab():
             st.caption("实时数据加载中…")
         else:
             _render_realtime_content(cached)   # 旧数据立刻上屏，不空白
-    if auto and is_market_open() and _rt_throttle_ok():
+    # 拉取条件：首次（无缓存）必拉一次拿收盘数据；之后仅交易时段 + 自动刷新 + 60s 限流
+    need_fetch = cached is None or (auto and is_market_open())
+    if need_fetch and _rt_throttle_ok():
         with st.status("实时行情刷新中…", expanded=True) as status:
             data = _realtime_load_all(status)
         st.session_state["rt_data"] = data
