@@ -12,7 +12,9 @@
 """
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -29,6 +31,17 @@ BATCH_SIZE = 400  # 每批 secids 上限（实测 300 只约 1.1s；400 批约 4
 FIELDS_QUOTE = "f2,f3,f6,f12,f13,f14,f104,f105"
 FIELDS_FLOW = "f2,f3,f6,f12,f14,f62,f66,f72,f78,f84,f184"
 RT_PROXY_ENV = "RT_PROXY"
+
+# ── 并发拉取配置（可通过环境变量调整；东财限流风险时调低）──
+RT_FLOW_WORKERS = int(os.environ.get("RT_FLOW_WORKERS", "4"))   # 成分股分批并发度
+RT_FLOW_RETRIES = int(os.environ.get("RT_FLOW_RETRIES", "2"))   # 每批失败重试次数
+
+_local = threading.local()          # 每线程独立 Session（keep-alive，避免跨线程共享）
+
+def _get_session() -> requests.Session:
+    if not hasattr(_local, "session"):
+        _local.session = requests.Session()
+    return _local.session
 
 
 def get_proxies() -> dict | None:
@@ -65,7 +78,7 @@ def etf_secid(fund_code6: str) -> str:
 
 
 def _request_json(url: str, params: dict, proxies: dict | None, timeout: int) -> dict:
-    r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, proxies=proxies)
+    r = _get_session().get(url, params=params, headers=HEADERS, timeout=timeout, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
@@ -144,40 +157,57 @@ def fetch_market_sentiment(quotes: pd.DataFrame | None = None,
 
 def fetch_stock_flow_realtime(stock_codes: list[str],
                               proxies: dict | None = None,
-                              batch_size: int = BATCH_SIZE) -> pd.DataFrame:
-    """成分股实时资金流（对外 1 次调用，内部自动分批串行 ulist）。
+                              batch_size: int = BATCH_SIZE,
+                              max_workers: int | None = None,
+                              max_retries: int | None = None) -> pd.DataFrame:
+    """成分股实时资金流（对外 1 次调用，内部自动分批**并发** ulist，默认 4 线程）。
 
     返回 DataFrame 列：
         stock_code(6位), stock_name, price, pct_chg, amount(元),
         main_net_amount, super_net_amount, big_net_amount,
         mid_net_amount, small_net_amount, main_net_ratio
     数值列 to_numeric(errors="coerce")（停牌/无数据返回 "-" → NaN）。
-    任一批失败：打印异常，保留已成功批次，不抛错。
+    任一批重试后仍失败：打印异常，保留已成功批次，不抛错（返回顺序不敏感）。
     """
-    all_rows = []
+    max_workers = max_workers or RT_FLOW_WORKERS
+    max_retries = max_retries if max_retries is not None else RT_FLOW_RETRIES
     codes = list(dict.fromkeys(str(c).split(".")[0].zfill(6) for c in stock_codes))
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i + batch_size]
-        try:
-            rows = _ulist_get([stock_secid(c) for c in batch], FIELDS_FLOW, proxies=proxies)
-        except Exception as e:
-            print(f"  [实时资金流] 批次 {i // batch_size + 1} 失败: {e}")
-            time.sleep(1)
-            continue
-        for x in rows:
-            all_rows.append({
-                "stock_code": str(x.get("f12", "")).zfill(6),
-                "stock_name": str(x.get("f14", "")),
-                "price": x.get("f2"),
-                "pct_chg": x.get("f3"),
-                "amount": x.get("f6"),
-                "main_net_amount": x.get("f62"),
-                "super_net_amount": x.get("f66"),
-                "big_net_amount": x.get("f72"),
-                "mid_net_amount": x.get("f78"),
-                "small_net_amount": x.get("f84"),
-                "main_net_ratio": x.get("f184"),
-            })
+    batches = [codes[i:i + batch_size] for i in range(0, len(codes), batch_size)]
+
+    def _fetch_batch(idx: int, batch: list[str]):
+        secids = [stock_secid(c) for c in batch]
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                return idx, _ulist_get(secids, FIELDS_FLOW, proxies=proxies), None
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    time.sleep(0.5 * (attempt + 1))   # 退避 0.5s / 1s
+        return idx, [], last_err
+
+    all_rows = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_fetch_batch, i, b) for i, b in enumerate(batches)]
+        for fut in as_completed(futures):
+            idx, rows, err = fut.result()
+            if err is not None:
+                print(f"  [实时资金流] 批次 {idx + 1} 失败(重试 {max_retries} 次后): {err}")
+                continue
+            for x in rows:
+                all_rows.append({
+                    "stock_code": str(x.get("f12", "")).zfill(6),
+                    "stock_name": str(x.get("f14", "")),
+                    "price": x.get("f2"),
+                    "pct_chg": x.get("f3"),
+                    "amount": x.get("f6"),
+                    "main_net_amount": x.get("f62"),
+                    "super_net_amount": x.get("f66"),
+                    "big_net_amount": x.get("f72"),
+                    "mid_net_amount": x.get("f78"),
+                    "small_net_amount": x.get("f84"),
+                    "main_net_ratio": x.get("f184"),
+                })
     df = pd.DataFrame(all_rows)
     if df.empty:
         return df
@@ -192,13 +222,14 @@ def fetch_stock_flow_realtime(stock_codes: list[str],
 # ============================================================
 
 def fetch_daily_amount_history(secids: list[str], days: int = 5,
-                               proxies: dict | None = None) -> dict:
-    """拉近 days 个交易日的日线成交额（kline 一次 1 个标的）。
+                               proxies: dict | None = None,
+                               max_workers: int = 6) -> dict:
+    """拉近 days 个交易日的日线成交额（kline，多标的**并发**，默认 6 线程）。
 
     返回 {secid: [近 days 日成交额(元), 旧→新]}；失败标的返回空列表。
     """
-    result = {}
-    for secid in secids:
+
+    def _fetch(secid: str):
         try:
             params = {
                 "secid": secid, "klt": "101", "fqt": "0",
@@ -207,8 +238,8 @@ def fetch_daily_amount_history(secids: list[str], days: int = 5,
                 "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
                 "ut": "b2884a393a59ad64002292a3e90d46a5",
             }
-            url = URL_KLINE if proxies is None else URL_KLINE
-            r = requests.get(url, params=params, headers=HEADERS, timeout=20, proxies=proxies)
+            r = _get_session().get(URL_KLINE, params=params, headers=HEADERS,
+                                   timeout=20, proxies=proxies)
             klines = ((r.json().get("data") or {}).get("klines")) or []
             amounts = []
             for line in klines:
@@ -216,11 +247,17 @@ def fetch_daily_amount_history(secids: list[str], days: int = 5,
                 # klines 行: 日期,开,收,高,低,成交量,成交额,...
                 if len(parts) >= 7:
                     amounts.append(pd.to_numeric(parts[6], errors="coerce"))
-            result[secid] = [a for a in amounts if pd.notna(a)][-days:]
+            return secid, [a for a in amounts if pd.notna(a)][-days:]
         except Exception as e:
             print(f"  [放量基准] {secid} 失败: {e}")
-            result[secid] = []
-        time.sleep(0.2)
+            return secid, []
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_fetch, s) for s in secids]
+        for fut in as_completed(futures):
+            secid, amounts = fut.result()
+            result[secid] = amounts
     return result
 
 
