@@ -18,8 +18,8 @@ from etf_fetcher import (load_etf_scale_cache as _load_etf_scale_cache,
                          NATIONAL_TEAM_ETF)
 from fund_flow_fetcher import load_fund_flow_cache
 from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime,
-                              index_secid, fetch_daily_amount_history,
-                              fetch_index_kline_close,
+                              index_secid,
+                              fetch_index_kline_close, fetch_index_volume_history,
                               aggregate_flow_realtime, build_index_map, get_proxies,
                               fetch_market_sentiment)
 
@@ -451,11 +451,14 @@ def load_ssindex_close() -> pd.DataFrame:
 
 
 def _ensure_hist(proxies: dict | None) -> dict:
-    """放量基准（近 5 日成交额，含两市指数）；仅首次真拉，之后复用 session_state"""
+    """量比/放缩量基准：指数近 5 日历史**成交量（手）**（新浪源，东财 push2his 常被限制）。
+
+    仅首次真拉，之后复用 session_state。返回 {secid: [近5日成交量(手), 旧→新]}。
+    """
     if "rt_hist" in st.session_state:
         return st.session_state["rt_hist"]
     secids = [index_secid(c) for c in FOCUS_INDICES] + ["1.000001", "0.399106"]
-    hist = fetch_daily_amount_history(secids, proxies=proxies)   # 内部已并发（6 线程），约 2s
+    hist = fetch_index_volume_history(secids)   # 内部并发（6 线程），约 3-4s
     st.session_state["rt_hist"] = hist
     return hist
 
@@ -1166,12 +1169,15 @@ def _render_realtime_content(rt: dict):
         <div class="metric-sub">上涨/下跌</div></div>""", unsafe_allow_html=True)
     with c4:
         cur_amt = float(sent.get("amount", 0) or 0)
+        # 放缩量对比（成交量口径）：实时两市成交量(手) vs 昨日同时段
         h1, h2 = hist.get("1.000001", []) or [], hist.get("0.399106", []) or []
-        if cur_amt > 0 and len(h1) >= 2 and len(h2) >= 2:
-            y_same = (h1[-2] + h2[-2]) * _time_progress()   # 昨日两市成交额 × 当日时间进度
-            diff = (cur_amt - y_same) / 1e8
-            cmp_txt = f"较昨日同时段 {diff:+,.0f}亿"
-            cmp_color = pct_color(diff)      # 放量红 / 缩量绿
+        cur_vol = float(quotes[quotes["code"] == "000001"]["volume"].sum()
+                        + quotes[quotes["code"] == "399106"]["volume"].sum()) if not quotes.empty else 0
+        if cur_vol > 0 and len(h1) >= 2 and len(h2) >= 2:
+            y_vol_same = (h1[-2] + h2[-2]) * _time_progress()   # 昨日两市成交量 × 当日进度
+            diff_pct = (cur_vol - y_vol_same) / max(y_vol_same, 1) * 100
+            cmp_txt = f"较昨日同时段 {'放量' if diff_pct >= 0 else '缩量'} {abs(diff_pct):.0f}%"
+            cmp_color = pct_color(diff_pct)      # 放量红 / 缩量绿
         else:
             cmp_txt, cmp_color = "较昨日同时段 -", "#AAA"
         st.markdown(f"""<div class="metric-card"><div class="metric-label">两市成交额</div>
@@ -1191,11 +1197,11 @@ def _render_realtime_content(rt: dict):
             q["点位"] = q["price"]
             q["涨跌幅%"] = q["pct_chg"]
             q["成交额(亿)"] = (q["amount"] / 1e8).round(0)
-            # 放量：实时成交额 vs 近5日同时段均值
+            # 量比（成交量口径）：实时成交量(手) vs 近5日同时段均值(手)
             prog = max(_time_progress(), 0.05)
             q["量比"] = q.apply(lambda r: round(
-                r["amount"] / (sum(hist.get(index_secid(r["code"]), [0])) / max(len(hist.get(index_secid(r["code"]), [0])), 1) * prog), 2)
-                if hist.get(index_secid(r["code"])) and r["amount"] else None, axis=1)
+                r["volume"] / (sum(hist.get(index_secid(r["code"]), [0])) / max(len(hist.get(index_secid(r["code"]), [0])), 1) * prog), 2)
+                if hist.get(index_secid(r["code"])) and r["volume"] else None, axis=1)
             q["放量"] = q["量比"].apply(lambda x: "放量" if x is not None and x >= VOLUME_RATIO else "")
             tbl = q[["指数", "点位", "涨跌幅%", "成交额(亿)", "量比", "放量"]]
             st.dataframe(style_color(tbl, ["涨跌幅%"]), use_container_width=True, hide_index=True,

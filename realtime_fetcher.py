@@ -28,7 +28,7 @@ HEADERS = {
     "Referer": "https://data.eastmoney.com/",
 }
 BATCH_SIZE = 400  # 每批 secids 上限（实测 300 只约 1.1s；400 批约 4495 只成分股 / 12 批）
-FIELDS_QUOTE = "f2,f3,f6,f12,f13,f14,f104,f105"
+FIELDS_QUOTE = "f2,f3,f5,f6,f12,f13,f14,f104,f105"   # f5=成交量(手) 供量比计算
 FIELDS_FLOW = "f2,f3,f6,f12,f14,f62,f66,f72,f78,f84,f184"
 RT_PROXY_ENV = "RT_PROXY"
 
@@ -112,7 +112,7 @@ def fetch_index_quotes(index_codes: list[str], proxies: dict | None = None) -> p
     """拉指数实时行情 + 市场情绪（合并 1 次 ulist 请求）。
 
     返回 DataFrame 列：code(f12), name(f14), price(f2), pct_chg(f3),
-                       amount(f6, 元), up_count(f104), down_count(f105)
+                       volume(f5, 手), amount(f6, 元), up_count(f104), down_count(f105)
     """
     # 上证综指 + 深证综指 提供 f104/f105（涨跌家数）与两市成交额
     secids = [index_secid(c) for c in index_codes] + ["1.000001", "0.399106"]
@@ -124,6 +124,7 @@ def fetch_index_quotes(index_codes: list[str], proxies: dict | None = None) -> p
             "name": str(x.get("f14", "")),
             "price": pd.to_numeric(x.get("f2"), errors="coerce"),
             "pct_chg": pd.to_numeric(x.get("f3"), errors="coerce"),
+            "volume": pd.to_numeric(x.get("f5"), errors="coerce"),
             "amount": pd.to_numeric(x.get("f6"), errors="coerce"),
             "up_count": pd.to_numeric(x.get("f104"), errors="coerce"),
             "down_count": pd.to_numeric(x.get("f105"), errors="coerce"),
@@ -291,6 +292,42 @@ def fetch_index_kline_close(secid: str, days: int = 500,
     except Exception as e:
         print(f"  [指数K线] {secid} 失败: {e}")
         return pd.DataFrame(columns=["date", "close"])
+
+
+def _sina_index_symbol(secid: str) -> str:
+    """东财 secid → 新浪 symbol：1.000001→sh000001、0.399006→sz399006、2.93xxxx→sh93xxxx"""
+    market, code = secid.split(".")
+    if market == "0":
+        return f"sz{code}"
+    return f"sh{code}"
+
+
+def fetch_index_volume_history(secids: list[str], days: int = 5,
+                               max_workers: int = 6) -> dict:
+    """指数近 N 日历史**成交量（手）**（新浪源，公网稳定；东财 push2his 常被限制）。
+
+    返回 {secid: [近 days 日成交量(手), 旧→新]}；失败标的返回空列表。
+    新浪 volume 单位为股 → 统一转手（/100），与东财实时 f5（手）口径一致。
+    """
+
+    def _fetch(secid: str):
+        try:
+            import akshare as ak
+            sym = _sina_index_symbol(secid)
+            k = ak.stock_zh_index_daily(symbol=sym)
+            vols = pd.to_numeric(k["volume"], errors="coerce").dropna()
+            return secid, [float(v) / 100.0 for v in vols.tail(days)]   # 股 → 手
+        except Exception as e:
+            print(f"  [量比基准] {secid} 失败: {e}")
+            return secid, []
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_fetch, s) for s in secids]
+        for fut in as_completed(futures):
+            secid, vols = fut.result()
+            result[secid] = vols
+    return result
 
 
 # ============================================================
