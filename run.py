@@ -72,6 +72,13 @@ def main():
     if hist_codes:
         fetch_fund_flow_history(sorted(hist_codes), sorted(all_dates))
 
+    # 1.9 全市场成交集中度（拥挤度）更新：首次回补 120 日，之后每日增量
+    from crowd_fetcher import ensure_crowd_history
+    try:
+        ensure_crowd_history()
+    except Exception as e:
+        print(f"⚠️ 拥挤度更新失败（不阻塞主流程）: {e}")
+
     # 2. 重新聚合
     margin_all = _load_margin_cache()
     if margin_all.empty:

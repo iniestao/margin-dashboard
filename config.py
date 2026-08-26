@@ -14,6 +14,10 @@ MARKET_CAP_DIR = DATA_DIR / "market_cap"
 AGGREGATED_DIR = DATA_DIR / "aggregated"
 ETF_SCALE_DIR = DATA_DIR / "etf_scale"
 ETF_NAV_DIR = DATA_DIR / "etf_nav"
+CROWD_DIR = DATA_DIR / "crowd"
+AMOUNT_CONC_CSV = CROWD_DIR / "amount_conc_hist.csv"
+STOCK_UNIVERSE_CSV = CROWD_DIR / "stock_universe.csv"
+CROWD_LOOKBACK = 120          # 首次回补天数
 
 # 用户提供的指数数据路径（相对路径，随项目移植）
 INDEX_WEIGHT_DIR = ROOT / "指数权重"

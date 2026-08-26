@@ -150,6 +150,69 @@ def compute_changes(dfs, lb):
 
 
 # ============================================================
+#  拥挤度（Tab5）：crowd_color / 融资拥挤度分位
+# ============================================================
+
+def crowd_color(v):
+    """拥挤度/分位着色：越高越红（拥挤警示），低绿。NaN/None 返回 ''"""
+    if v is None or (isinstance(v, float) and (v != v)):
+        return ""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if v >= 0.75:
+        return RED
+    if v >= 0.50:
+        return "#E8922E"   # 橙
+    return GREEN
+
+
+def crowding_label(pct) -> str:
+    if pct >= 0.9:
+        return "极高拥挤"
+    if pct >= 0.75:
+        return "高拥挤"
+    if pct >= 0.50:
+        return "偏拥挤"
+    if pct >= 0.25:
+        return "中性"
+    return "低拥挤"
+
+
+@st.cache_data(ttl=3600)
+def compute_fin_crowding(results: dict, window: int) -> pd.DataFrame:
+    """147 指数融资余额近 window 日分位（窗口超历史自动取全部；列名标注实际历史长度）。
+
+    返回 DataFrame：指数/代码/融资余额(亿)/近N日分位/拥挤度，按分位降序。
+    """
+    rows = []
+    for code, df in results.items():
+        df_s = df.sort_values("trade_date")
+        bal = df_s["total_rz_balance"].dropna()
+        if bal.empty:
+            continue
+        hist = bal.tail(window)
+        cur = float(hist.iloc[-1])
+        pct = float(hist.rank(pct=True).iloc[-1])
+        rows.append({"指数": df_s["index_name"].iloc[0], "代码": code,
+                     "融资余额(亿)": round(cur / 1e8, 1),
+                     f"近{len(hist)}日分位": round(pct, 3),
+                     "拥挤度": crowding_label(pct)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    col = [c for c in out.columns if "日分位" in c][0]
+    return out.sort_values(col, ascending=False)
+
+
+def load_crowd_amount_hist():
+    """全市场前 5% 成交额占比历史序列（CSV 缓存）"""
+    from crowd_fetcher import load_amount_conc_hist as _l
+    return _l()
+
+
+# ============================================================
 #  ETF 份额 / 金额
 # ============================================================
 # 国家队持仓 ETF 池定义见 etf_fetcher.py（NATIONAL_TEAM_ETF）
@@ -567,7 +630,7 @@ if not etf_scale.empty and not etf_nav.empty:
 
 st.markdown("""<h1>A股资金监控看板</h1>""", unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向", "实时行情"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向", "实时行情", "拥挤度"])
 
 # ============================================================
 #  Tab 1: A股指数融资额（原有全部内容）
@@ -1334,8 +1397,136 @@ with tab4:
     render_realtime_tab()
 
 
+# ============================================================
+#  Tab 5: 拥挤度
+# ============================================================
+with tab5:
+    st.markdown("### 拥挤度")
+    st.caption("口径：① 融资拥挤度 = 指数融资余额近 N 日历史分位（越高越拥挤，>75% 高拥挤）；"
+               "② 全市场成交集中度 = 成交额前 5% 股票合计 / 全市场成交额（越大越抱团）。"
+               "数据源：融资余额取自每日聚合缓存；成交额历史由腾讯日线回补 + 每日东财快照增量。")
+
+    # 分位窗口选择
+    w_opt = st.radio("分位窗口", ["近1年(全部)", "120日", "60日", "20日"],
+                     horizontal=True, index=0, key="tab5_window")
+    window_map = {"近1年(全部)": None, "120日": 120, "60日": 60, "20日": 20}
+    window = window_map[w_opt]
+
+    amt_hist = load_crowd_amount_hist()
+    fin_crowd = None
+    if results:
+        fin_crowd = compute_fin_crowding(results, window if window else 10 ** 6)
+    if not results:
+        st.info("融资数据生成中，请稍候刷新（首次部署需先运行数据更新）")
+    if amt_hist.empty:
+        st.info("全市场成交集中度历史生成中：请先运行 `python cloud_update.py`（首次含腾讯日线回补，约 20-40 分钟）；之后每日自动增量。")
+
+    # 实际历史长度标注
+    n_fin = 0
+    if fin_crowd is not None and not fin_crowd.empty:
+        n_fin = int([c for c in fin_crowd.columns if "日分位" in c][0].replace("近", "").replace("日分位", ""))
+    n_amt = len(amt_hist) if not amt_hist.empty else 0
+    st.caption(f"实际数据：融资历史约 {n_fin} 个交易日；前5%成交额占比历史 {n_amt} 个交易日")
+
+    # ── 全市场拥挤度卡 ──
+    if not amt_hist.empty:
+        sub = amt_hist["top5_pct"].tail(window if window else len(amt_hist))
+        cur = float(sub.iloc[-1])
+        pct = float(sub.rank(pct=True).iloc[-1])
+        chg = (cur - float(sub.iloc[-2])) if len(sub) >= 2 else None
+        total_amt = float(amt_hist["total_amount"].iloc[-1])
+        last_date = amt_hist["trade_date"].iloc[-1].strftime("%Y-%m-%d")
+        c1, c2, c3, c4, c5 = st.columns(5, gap="medium")
+        with c1:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">前5%成交额占比</div>
+            <div class="metric-value" style="font-size:19px;color:{crowd_color(pct)}">{cur:.1f}%</div>
+            <div class="metric-sub">全市场</div></div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">近窗口分位</div>
+            <div class="metric-value" style="font-size:19px;color:{crowd_color(pct)}">{pct*100:.0f}%</div>
+            <div class="metric-sub">{"极高拥挤" if pct >= 0.9 else ("高拥挤" if pct >= 0.75 else "偏拥挤" if pct >= 0.5 else "低拥挤")}</div></div>""", unsafe_allow_html=True)
+        with c3:
+            chg_txt = f"{chg:+.1f}pp" if chg is not None else "-"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">较前日</div>
+            <div class="metric-value" style="font-size:19px;color:{pct_color(chg) if chg is not None else '#AAA'}">{chg_txt}</div>
+            <div class="metric-sub">前5%占比变化</div></div>""", unsafe_allow_html=True)
+        with c4:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">全市场成交额</div>
+            <div class="metric-value" style="font-size:19px">{total_amt/1e8:,.0f}亿</div>
+            <div class="metric-sub">当日</div></div>""", unsafe_allow_html=True)
+        with c5:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">数据日期</div>
+            <div class="metric-value" style="font-size:19px">{last_date}</div>
+            <div class="metric-sub">最新交易日</div></div>""", unsafe_allow_html=True)
+
+        # ── 全市场成交集中度趋势图 ──
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        st.markdown("### 全市场成交集中度趋势")
+        fig5 = make_subplots(specs=[[{"secondary_y": True}]])
+        fig5.add_trace(go.Scatter(
+            x=amt_hist["trade_date"], y=amt_hist["top5_pct"],
+            name="前5%成交额占比(%)", line=dict(width=2.0, color="#D33F49"),
+            hovertemplate="%{x|%Y-%m-%d}<br>占比 %{y:.1f}%<extra></extra>",
+        ), secondary_y=False)
+        fig5.add_trace(go.Bar(
+            x=amt_hist["trade_date"], y=amt_hist["total_amount"] / 1e8,
+            name="全市场成交额(亿)", marker_color="rgba(59,130,246,0.25)",
+            hovertemplate="%{x|%Y-%m-%d}<br>成交 %{y:,.0f}亿<extra></extra>",
+        ), secondary_y=True)
+        fig5.update_layout(
+            height=340, margin=dict(l=0, r=0, t=0, b=0), bargap=0.4,
+            legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center",
+                        font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+            hovermode="x unified",
+            xaxis=dict(type="date", tickformat="%m-%d", showgrid=True, gridcolor="#f0f0f0",
+                       showline=False, tickfont=dict(size=11, color="#888")),
+            yaxis=dict(title="占比(%)", showgrid=True, gridcolor="#f0f0f0",
+                       showline=False, tickfont=dict(size=11, color="#888")),
+            yaxis2=dict(title="成交额(亿)", showgrid=False, showline=False,
+                        tickfont=dict(size=11, color="#AAA"),
+                        overlaying="y", side="right"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Microsoft YaHei, PingFang SC, sans-serif"),
+        )
+        st.plotly_chart(fig5, use_container_width=True)
+
+    # ── 融资拥挤度排行 ──
+    if fin_crowd is not None and not fin_crowd.empty:
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        st.markdown("### 指数融资拥挤度排行")
+        pct_col = [c for c in fin_crowd.columns if "日分位" in c][0]
+        fc1, fc2 = st.columns(2, gap="medium")
+        for col, data, label, icon in [(fc1, fin_crowd.head(5), "最拥挤 TOP5", "🔥"),
+                                       (fc2, fin_crowd.tail(5).iloc[::-1], "最冷清 TOP5", "❄️")]:
+            with col:
+                st.caption(f"{icon} {label}")
+                for _, r in data.iterrows():
+                    p = float(r[pct_col])
+                    st.markdown(f"""
+                    <div class="rank-card">
+                        <div class="rank-title">{r['指数']}
+                            <span class="rank-badge" style="color:{crowd_color(p)}">{p*100:.0f}%</span>
+                        </div>
+                        <div class="rank-meta">融资余额 {r['融资余额(亿)']}亿 · {r['拥挤度']}</div>
+                    </div>""", unsafe_allow_html=True)
+        kw5 = st.text_input("搜索指数", key="tab5_search",
+                            placeholder="输入指数名称或代码，如 沪深300 / 000300").strip()
+        if kw5:
+            f5 = fin_crowd[fin_crowd["指数"].str.contains(kw5, case=False, na=False, regex=False)
+                           | fin_crowd["代码"].str.contains(kw5, case=False, na=False, regex=False)]
+        else:
+            f5 = fin_crowd
+        with st.expander(f"查看全部 {len(fin_crowd)} 个指数拥挤度" + (f"（匹配 {len(f5)} 个）" if kw5 else "")):
+            st.dataframe(f5, use_container_width=True, hide_index=True,
+                         column_config={
+                             pct_col: st.column_config.NumberColumn(format="%.1f%%"),
+                             "融资余额(亿)": st.column_config.NumberColumn(format="%.1f"),
+                         })
+        st.caption("注：拥挤度 = 融资余额历史分位（越高越拥挤）；窗口超出历史时按实际交易日计算")
+
+
 st.markdown("""
 <div style='text-align:center;padding:32px 0 16px 0;color:#bbb;font-size:11px;border-top:1px solid #eee;margin-top:32px'>
-    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向 · 实时行情
+    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向 · 实时行情 · 拥挤度
 </div>
 """, unsafe_allow_html=True)
