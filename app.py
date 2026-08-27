@@ -1484,14 +1484,28 @@ with tab5:
                     sub5["名称"] = sub5["stock_name"].fillna("")
                     sub5["成交额(亿)"] = (sub5["amount"] / 1e8).round(1)
                     sub5["占全市场%"] = sub5["share_pct"]
-                    dc5 = ["rank", "stock_code", "名称", "成交额(亿)", "占全市场%"]
+                    has_pct = "pct_chg" in sub5.columns
+                    if has_pct:
+                        def _fmt_pct(v):
+                            try:
+                                v = float(v)
+                                return f"{v:+.2f}%"
+                            except (TypeError, ValueError):
+                                return "-"
+                        dc5 = ["rank", "stock_code", "名称", "成交额(亿)", "占全市场%", "涨跌幅"]
+                        if has_pct:
+                            sub5["涨跌幅"] = sub5["pct_chg"].map(_fmt_pct)
+                    else:
+                        dc5 = ["rank", "stock_code", "名称", "成交额(亿)", "占全市场%"]
                     st.caption(f"{sel_date.strftime('%Y-%m-%d')} · 成交额前 5% 共 {len(sub5)} 只 · 按成交额降序")
-                    st.dataframe(sub5[dc5], use_container_width=True, hide_index=True,
-                                 column_config={
-                                     "rank": st.column_config.NumberColumn(format="%d"),
-                                     "成交额(亿)": st.column_config.NumberColumn(format="%.1f"),
-                                     "占全市场%": st.column_config.NumberColumn(format="%.2f"),
-                                 })
+                    cfg5 = {
+                        "rank": st.column_config.NumberColumn(format="%d"),
+                        "成交额(亿)": st.column_config.NumberColumn(format="%.1f"),
+                        "占全市场%": st.column_config.NumberColumn(format="%.2f"),
+                    }
+                    if has_pct:
+                        cfg5["涨跌幅"] = st.column_config.TextColumn()
+                    st.dataframe(sub5[dc5], use_container_width=True, hide_index=True, column_config=cfg5)
     except Exception as e:
         import traceback; traceback.print_exc()
         st.warning(f"拥挤度渲染异常，已跳过部分内容：{str(e)[:120]}")

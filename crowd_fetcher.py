@@ -66,17 +66,20 @@ def fetch_qq_kline_amount(code: str, proxies: dict | None = None) -> pd.DataFram
     klines = data.get("qfqday") or data.get("day") or []
     rows = []
     for line in klines:
-        # 行 10 字段：idx0=日期、idx7=换手率、idx8=成交额(万元)
+        # 行 10 字段：idx0=日期、idx2=收盘价(复权)、idx7=换手率、idx8=成交额(万元)
         if len(line) < 9:
             continue
         d = pd.to_datetime(line[0], errors="coerce")
         a = pd.to_numeric(line[8], errors="coerce")
+        c = pd.to_numeric(line[2], errors="coerce")
         if pd.notna(d) and pd.notna(a):
-            rows.append((d, a * 10000.0))   # 万元 → 元
+            rows.append((d, a * 10000.0, c))   # 万元 → 元；close 供涨跌幅计算
     if not rows:
         raise ValueError(f"{sym} 无 kline 数据")
-    return (pd.DataFrame(rows, columns=["trade_date", "amount"])
-              .sort_values("trade_date").reset_index(drop=True))
+    df = (pd.DataFrame(rows, columns=["trade_date", "amount", "close"])
+            .sort_values("trade_date").reset_index(drop=True))
+    df["pct_chg"] = (df["close"].pct_change() * 100).round(2)   # 相邻收盘涨跌幅(%)
+    return df[["trade_date", "amount", "pct_chg"]]
 
 
 def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
@@ -163,10 +166,11 @@ def compute_top5_pct(amount_series: pd.Series) -> dict:
             "total_amount": total, "top5_amount": top5, "stock_count": int(len(s))}
 
 
-def _top5_detail_rows(amount_series: pd.Series, name_map: dict | None = None) -> list[dict]:
+def _top5_detail_rows(amount_series: pd.Series, name_map: dict | None = None,
+                      pct_map: dict | None = None) -> list[dict]:
     """返回当日前 5% 股票的明细行（rank 从 1 起，1=成交额最大）。
 
-    行: {"stock_code", "stock_name", "amount", "rank", "share_pct"(占全市场%)}
+    行: {"stock_code", "stock_name", "amount", "rank", "share_pct"(占全市场%), "pct_chg"(当日涨跌幅%)}
     """
     s = pd.to_numeric(amount_series, errors="coerce").dropna()
     s = s[s > 0]
@@ -176,14 +180,18 @@ def _top5_detail_rows(amount_series: pd.Series, name_map: dict | None = None) ->
     top_n = max(1, int(len(s) * 0.05))
     top = s.sort_values(ascending=False).head(top_n)
     name_map = name_map or {}
+    pct_map = pct_map or {}
     rows = []
     for rank, (code, amt) in enumerate(top.items(), start=1):
+        code6 = str(code).zfill(6)
+        pc = pct_map.get(code6)
         rows.append({
-            "stock_code": str(code).zfill(6),
-            "stock_name": str(name_map.get(str(code).zfill(6), name_map.get(str(code), ""))),
+            "stock_code": code6,
+            "stock_name": str(name_map.get(code6, name_map.get(str(code), ""))),
             "amount": float(amt),
             "rank": rank,
             "share_pct": round(float(amt) / total * 100, 3) if total > 0 else 0.0,
+            "pct_chg": (round(float(pc), 2) if pc is not None and pd.notna(pc) else float("nan")),
         })
     return rows
 
@@ -228,6 +236,7 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
     t0 = time.time()
     # 并发拉每只股票 → 按日累积 {date: {code: amount}}
     day_amounts: dict = {d: {} for d in missing}
+    day_pcts: dict = {d: {} for d in missing}   # 每日各股涨跌幅(%)
     failed = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(fetch_qq_kline_amount, c, proxies): c for c in codes}
@@ -243,6 +252,7 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
                     d = r["trade_date"].normalize()
                     if d in day_amounts:
                         day_amounts[d][code] = float(r["amount"])
+                        day_pcts[d][code] = float(r["pct_chg"]) if pd.notna(r["pct_chg"]) else None
             except Exception as e:
                 failed += 1
                 if failed <= 3:
@@ -259,7 +269,7 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
             print(f"  [回补] ⚠️ {d.strftime('%Y-%m-%d')} 仅 {row['stock_count']} 只有效，跳过该日")
             continue
         new_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **row})
-        for dr in _top5_detail_rows(amts, name_map):
+        for dr in _top5_detail_rows(amts, name_map, day_pcts.get(d)):
             detail_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **dr})
     df_new = pd.DataFrame(new_rows)
 
@@ -310,8 +320,15 @@ def ensure_crowd_history(proxies: dict | None = None) -> None:
     detail = load_top5_daily()
     n_hist = len(hist["trade_date"].unique()) if not hist.empty else 0
     n_detail = len(detail["trade_date"].unique()) if not detail.empty else 0
+    # 明细缺 pct_chg 列（旧结构）也触发全量重建
+    no_pct_col = (not detail.empty and "pct_chg" not in detail.columns)
     if not hist.empty and n_detail < n_hist:
         print(f">>> 拥挤度明细 {n_detail} 日 < 序列 {n_hist} 日 → 清空缓存全量重建")
+        for f in (AMOUNT_CONC_CSV, TOP5_DETAIL_CSV):
+            if f.exists():
+                f.unlink()
+    elif no_pct_col:
+        print(">>> 拥挤度明细缺少涨跌幅列（旧结构）→ 清空缓存全量重建")
         for f in (AMOUNT_CONC_CSV, TOP5_DETAIL_CSV):
             if f.exists():
                 f.unlink()
