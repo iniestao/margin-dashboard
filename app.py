@@ -150,7 +150,7 @@ def compute_changes(dfs, lb):
 
 
 # ============================================================
-#  拥挤度（Tab5）：crowd_color / 融资拥挤度分位
+#  拥挤度（Tab5）：crowd_color / 成交集中度数据
 # ============================================================
 
 def crowd_color(v):
@@ -168,48 +168,6 @@ def crowd_color(v):
     return GREEN
 
 
-def crowding_label(pct) -> str:
-    if pct >= 0.9:
-        return "极高拥挤"
-    if pct >= 0.75:
-        return "高拥挤"
-    if pct >= 0.50:
-        return "偏拥挤"
-    if pct >= 0.25:
-        return "中性"
-    return "低拥挤"
-
-
-def compute_fin_crowding(results: dict, window: int) -> pd.DataFrame:
-    """147 指数融资余额近 window 日分位（窗口超历史自动取全部）。
-
-    返回 DataFrame：指数/代码/融资余额(亿)/近N日分位/拥挤度，按分位降序。
-    注：不缓存——results 为 147 指数大 dict，cache_data 序列化开销大且会过期重算。
-    """
-    rows = []
-    max_hist = 0
-    for code, df in results.items():
-        df_s = df.sort_values("trade_date")
-        bal = df_s["total_rz_balance"].dropna()
-        if bal.empty:
-            continue
-        hist = bal.tail(window)
-        max_hist = max(max_hist, len(hist))
-        cur = float(hist.iloc[-1])
-        pct = float(hist.rank(pct=True).iloc[-1])
-        rows.append({"指数": df_s["index_name"].iloc[0], "代码": code,
-                     "融资余额(亿)": round(cur / 1e8, 1),
-                     "_pct": round(pct, 3), "拥挤度": crowding_label(pct)})
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    # 统一分位列名（避免各指数历史长度不同产生多个分位列导致错乱）
-    col = "近%d日分位" % max_hist
-    out[col] = out["_pct"]
-    out = out.drop(columns=["_pct"])
-    return out.sort_values(col, ascending=False)
-
-
 def load_crowd_amount_hist():
     """全市场前 5% 成交额占比历史序列（CSV 缓存）；读取失败返回空表，不抛异常"""
     try:
@@ -218,6 +176,16 @@ def load_crowd_amount_hist():
     except Exception as e:
         print(f"  [拥挤度] 读取成交集中度历史失败: {e}")
         return pd.DataFrame(columns=["trade_date", "top5_pct", "total_amount", "top5_amount", "stock_count"])
+
+
+def load_top5_detail_data():
+    """前 5% 成交额明细（按日）；读取失败返回空表，不抛异常"""
+    try:
+        from crowd_fetcher import load_top5_daily as _l
+        return _l()
+    except Exception as e:
+        print(f"  [拥挤度] 读取前5%明细失败: {e}")
+        return pd.DataFrame(columns=["trade_date", "stock_code", "stock_name", "amount", "rank", "share_pct"])
 
 
 # ============================================================
@@ -1410,9 +1378,8 @@ with tab4:
 # ============================================================
 with tab5:
     st.markdown("### 拥挤度")
-    st.caption("口径：① 融资拥挤度 = 指数融资余额近 N 日历史分位（越高越拥挤，>75% 高拥挤）；"
-               "② 全市场成交集中度 = 成交额前 5% 股票合计 / 全市场成交额（越大越抱团）。"
-               "数据源：融资余额取自每日聚合缓存；成交额历史由腾讯日线回补 + 每日东财快照增量。")
+    st.caption("口径：全市场成交集中度 = 成交额前 5% 股票合计 / 全市场成交额（越大越抱团/越拥挤）。"
+               "数据源：成交额历史由腾讯日线回补 + 每日东财快照增量。")
 
     # 分位窗口选择
     w_opt = st.radio("分位窗口", ["近1年(全部)", "120日", "60日", "20日"],
@@ -1423,26 +1390,19 @@ with tab5:
     try:
         with st.status("拥挤度数据加载中…", expanded=False) as _s:
             amt_hist = load_crowd_amount_hist()
-            fin_crowd = None
-            if results:
-                fin_crowd = compute_fin_crowding(results, window if window else 10 ** 6)
+            top5_detail = load_top5_detail_data()
             _s.update(label="拥挤度数据已加载", state="complete", expanded=False)
     except Exception as e:
         st.warning(f"拥挤度数据加载异常，请稍后重试：{str(e)[:120]}")
         amt_hist = pd.DataFrame(columns=["trade_date", "top5_pct", "total_amount", "top5_amount", "stock_count"])
-        fin_crowd = None
-    if not results:
-        st.info("融资数据生成中，请稍候刷新（首次部署需先运行数据更新）")
+        top5_detail = pd.DataFrame(columns=["trade_date", "stock_code", "stock_name", "amount", "rank", "share_pct"])
     if amt_hist.empty:
         st.info("全市场成交集中度历史生成中：请先运行 `python cloud_update.py`（首次含腾讯日线回补，约 20-40 分钟）；之后每日自动增量。")
 
     try:
         # 实际历史长度标注
-        n_fin = 0
-        if fin_crowd is not None and not fin_crowd.empty:
-            n_fin = int([c for c in fin_crowd.columns if "日分位" in c][0].replace("近", "").replace("日分位", ""))
         n_amt = len(amt_hist) if not amt_hist.empty else 0
-        st.caption(f"实际数据：融资历史约 {n_fin} 个交易日；前5%成交额占比历史 {n_amt} 个交易日")
+        st.caption(f"实际数据：前5%成交额占比历史 {n_amt} 个交易日")
 
         # ── 全市场拥挤度卡 ──
         if not amt_hist.empty:
@@ -1506,39 +1466,32 @@ with tab5:
             )
             st.plotly_chart(fig5, use_container_width=True)
 
-        # ── 融资拥挤度排行 ──
-        if fin_crowd is not None and not fin_crowd.empty:
+            # ── 前5%成交额明细（按日切换）──
             st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-            st.markdown("### 指数融资拥挤度排行")
-            pct_col = [c for c in fin_crowd.columns if "日分位" in c][0]
-            fc1, fc2 = st.columns(2, gap="medium")
-            for col, data, label, icon in [(fc1, fin_crowd.head(5), "最拥挤 TOP5", "🔥"),
-                                           (fc2, fin_crowd.tail(5).iloc[::-1], "最冷清 TOP5", "❄️")]:
-                with col:
-                    st.caption(f"{icon} {label}")
-                    for _, r in data.iterrows():
-                        p = float(r[pct_col])
-                        st.markdown(f"""
-                        <div class="rank-card">
-                            <div class="rank-title">{r['指数']}
-                                <span class="rank-badge" style="color:{crowd_color(p)}">{p*100:.0f}%</span>
-                            </div>
-                            <div class="rank-meta">融资余额 {r['融资余额(亿)']}亿 · {r['拥挤度']}</div>
-                        </div>""", unsafe_allow_html=True)
-            kw5 = st.text_input("搜索指数", key="tab5_search",
-                                placeholder="输入指数名称或代码，如 沪深300 / 000300").strip()
-            if kw5:
-                f5 = fin_crowd[fin_crowd["指数"].str.contains(kw5, case=False, na=False, regex=False)
-                               | fin_crowd["代码"].str.contains(kw5, case=False, na=False, regex=False)]
+            st.markdown("### 前5%成交额明细")
+            if top5_detail.empty:
+                st.caption("明细数据生成中：需要重跑一次回补落盘（云端更新会自动完成），之后可逐日查看")
             else:
-                f5 = fin_crowd
-            with st.expander(f"查看全部 {len(fin_crowd)} 个指数拥挤度" + (f"（匹配 {len(f5)} 个）" if kw5 else "")):
-                st.dataframe(f5, use_container_width=True, hide_index=True,
-                             column_config={
-                                 pct_col: st.column_config.NumberColumn(format="%.1f%%"),
-                                 "融资余额(亿)": st.column_config.NumberColumn(format="%.1f"),
-                             })
-            st.caption("注：拥挤度 = 融资余额历史分位（越高越拥挤）；窗口超出历史时按实际交易日计算")
+                detail_dates = sorted(top5_detail["trade_date"].unique())
+                sel_date = st.selectbox("选择日期", detail_dates,
+                                        index=len(detail_dates) - 1,
+                                        format_func=lambda d: d.strftime("%Y-%m-%d"),
+                                        key="tab5_detail_date")
+                sub5 = top5_detail[top5_detail["trade_date"] == sel_date].copy()
+                if sub5.empty:
+                    st.caption("该日无明细数据")
+                else:
+                    sub5["名称"] = sub5["stock_name"].fillna("")
+                    sub5["成交额(亿)"] = (sub5["amount"] / 1e8).round(1)
+                    sub5["占全市场%"] = sub5["share_pct"]
+                    dc5 = ["rank", "stock_code", "名称", "成交额(亿)", "占全市场%"]
+                    st.caption(f"{sel_date.strftime('%Y-%m-%d')} · 成交额前 5% 共 {len(sub5)} 只 · 按成交额降序")
+                    st.dataframe(sub5[dc5], use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "rank": st.column_config.NumberColumn(format="%d"),
+                                     "成交额(亿)": st.column_config.NumberColumn(format="%.1f"),
+                                     "占全市场%": st.column_config.NumberColumn(format="%.2f"),
+                                 })
     except Exception as e:
         import traceback; traceback.print_exc()
         st.warning(f"拥挤度渲染异常，已跳过部分内容：{str(e)[:120]}")

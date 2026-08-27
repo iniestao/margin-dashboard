@@ -16,6 +16,7 @@ ETF_SCALE_DIR = DATA_DIR / "etf_scale"
 ETF_NAV_DIR = DATA_DIR / "etf_nav"
 CROWD_DIR = DATA_DIR / "crowd"
 AMOUNT_CONC_CSV = CROWD_DIR / "amount_conc_hist.csv"
+TOP5_DETAIL_CSV = CROWD_DIR / "top5_daily.csv"
 STOCK_UNIVERSE_CSV = CROWD_DIR / "stock_universe.csv"
 CROWD_LOOKBACK = 120          # 首次回补天数
 

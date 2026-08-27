@@ -159,6 +159,31 @@ def compute_top5_pct(amount_series: pd.Series) -> dict:
             "total_amount": total, "top5_amount": top5, "stock_count": int(len(s))}
 
 
+def _top5_detail_rows(amount_series: pd.Series, name_map: dict | None = None) -> list[dict]:
+    """返回当日前 5% 股票的明细行（rank 从 1 起，1=成交额最大）。
+
+    行: {"stock_code", "stock_name", "amount", "rank", "share_pct"(占全市场%)}
+    """
+    s = pd.to_numeric(amount_series, errors="coerce").dropna()
+    s = s[s > 0]
+    if s.empty:
+        return []
+    total = float(s.sum())
+    top_n = max(1, int(len(s) * 0.05))
+    top = s.sort_values(ascending=False).head(top_n)
+    name_map = name_map or {}
+    rows = []
+    for rank, (code, amt) in enumerate(top.items(), start=1):
+        rows.append({
+            "stock_code": str(code).zfill(6),
+            "stock_name": str(name_map.get(str(code).zfill(6), name_map.get(str(code), ""))),
+            "amount": float(amt),
+            "rank": rank,
+            "share_pct": round(float(amt) / total * 100, 3) if total > 0 else 0.0,
+        })
+    return rows
+
+
 def _trading_dates(days: int) -> list:
     """近 days 个交易日（datetime，升序）"""
     from data_fetcher import _get_trading_dates
@@ -218,12 +243,16 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
                 if failed <= 3:
                     print(f"  [回补] {code} 失败: {str(e)[:80]}")
 
-    # 逐日算占比
+    # 逐日算占比 + 前5%明细
     new_rows = []
+    detail_rows = []
+    name_map = dict(zip(uni["stock_code"].astype(str).str.zfill(6), uni["stock_name"].astype(str)))
     for d in sorted(day_amounts):
         amts = pd.Series(day_amounts[d])
         row = compute_top5_pct(amts)
         new_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **row})
+        for dr in _top5_detail_rows(amts, name_map):
+            detail_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **dr})
     df_new = pd.DataFrame(new_rows)
 
     # 失败占比校验后写盘
@@ -238,9 +267,26 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
         df_new = pd.concat([old, df_new], ignore_index=True)
     df_new = df_new.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     df_new.to_csv(AMOUNT_CONC_CSV, index=False)
+    # 前5%明细落盘（追加/合并）
+    _save_top5_detail(detail_rows)
     print(f"✅ 拥挤度回补完成：新增 {len(new_rows)} 日，失败 {failed}/{len(codes)}，耗时 {time.time()-t0:.0f}s")
     return {"backfilled_dates": len(new_rows), "total_dates": len(target_dates),
             "failed_stocks": failed, "total_stocks": len(codes)}
+
+
+def _save_top5_detail(detail_rows: list[dict]) -> None:
+    """前5%明细落盘 data/crowd/top5_daily.csv（按 (trade_date, rank) 合并去重）"""
+    from config import CROWD_DIR, TOP5_DETAIL_CSV
+    if not detail_rows:
+        return
+    CROWD_DIR.mkdir(parents=True, exist_ok=True)
+    df_new = pd.DataFrame(detail_rows)
+    if TOP5_DETAIL_CSV.exists():
+        old = pd.read_csv(TOP5_DETAIL_CSV)
+        df_new = pd.concat([old, df_new], ignore_index=True)
+    df_new = (df_new.sort_values(["trade_date", "rank"])
+                   .drop_duplicates(["trade_date", "rank"], keep="last"))
+    df_new.to_csv(TOP5_DETAIL_CSV, index=False)
 
 
 def update_amount_conc_daily(proxies: dict | None = None) -> bool:
@@ -258,26 +304,34 @@ def update_amount_conc_daily(proxies: dict | None = None) -> bool:
     if uni.empty or uni["amount"].isna().all():
         print("⚠️ 当日成交额获取失败，跳过增量")
         return False
-    row = {"trade_date": pd.to_datetime(target).strftime("%Y-%m-%d"),
-           **compute_top5_pct(uni["amount"])}
+    date_str = pd.to_datetime(target).strftime("%Y-%m-%d")
+    row = {"trade_date": date_str, **compute_top5_pct(uni["amount"])}
     df_new = pd.DataFrame([row])
     if AMOUNT_CONC_CSV.exists():
         old = pd.read_csv(AMOUNT_CONC_CSV)
         df_new = pd.concat([old, df_new], ignore_index=True)
     df_new = df_new.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     df_new.to_csv(AMOUNT_CONC_CSV, index=False)
-    print(f"✅ 拥挤度增量更新：{row['trade_date']} 前5%占比 {row['top5_pct']:.1f}%")
+    # 当日前5%明细落盘
+    name_map = dict(zip(uni["stock_code"].astype(str).str.zfill(6), uni["stock_name"].astype(str)))
+    detail = [{"trade_date": date_str, **dr} for dr in _top5_detail_rows(uni["amount"], name_map)]
+    _save_top5_detail(detail)
+    print(f"✅ 拥挤度增量更新：{date_str} 前5%占比 {row['top5_pct']:.1f}%")
     return True
 
 
 def ensure_crowd_history(proxies: dict | None = None) -> None:
-    """更新流程入口：CSV 空/最新日期落后 → 回补；否则每日增量。供 run.py / cloud_update.py 复用。"""
+    """更新流程入口：CSV 空/最新日期落后/明细缺失 → 回补；否则每日增量。供 run.py / cloud_update.py 复用。"""
+    from config import TOP5_DETAIL_CSV
     hist = load_amount_conc_hist()
+    detail = load_top5_daily()
     try:
         latest_target = pd.to_datetime(_snapshot_date())
     except Exception:
         latest_target = None
-    if hist.empty or latest_target is None or hist["trade_date"].max().normalize() < latest_target:
+    detail_incomplete = (not detail.empty and not hist.empty
+                         and len(detail["trade_date"].unique()) < len(hist["trade_date"].unique()))
+    if hist.empty or latest_target is None or hist["trade_date"].max().normalize() < latest_target or detail_incomplete:
         backfill_amount_conc(days=int(os.environ.get("CROWD_LOOKBACK", "120")), proxies=proxies)
     else:
         update_amount_conc_daily(proxies=proxies)
@@ -291,6 +345,16 @@ def load_amount_conc_hist() -> pd.DataFrame:
     df = pd.read_csv(AMOUNT_CONC_CSV)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     return df.sort_values("trade_date").reset_index(drop=True)
+
+
+def load_top5_daily() -> pd.DataFrame:
+    """读前 5% 明细；返回 DataFrame(trade_date(datetime), stock_code, stock_name, amount, rank, share_pct)；缺失返回空。"""
+    from config import TOP5_DETAIL_CSV
+    if not TOP5_DETAIL_CSV.exists():
+        return pd.DataFrame(columns=["trade_date", "stock_code", "stock_name", "amount", "rank", "share_pct"])
+    df = pd.read_csv(TOP5_DETAIL_CSV)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    return df.sort_values(["trade_date", "rank"]).reset_index(drop=True)
 
 
 if __name__ == "__main__":
