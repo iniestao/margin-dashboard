@@ -89,6 +89,7 @@ def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
     """全市场沪深 A 股清单（含当日成交额），列 stock_code/stock_name/amount(元)。
 
     首选 akshare spot_em（东财实时，1 请求）；失败降级东财 clist 分页；再降级 fund_flow 快照并集（无成交额）。
+    完整性校验：少于 3000 只视为残缺清单（会导致占比虚高），继续尝试下一来源。
     """
     try:
         import akshare as ak
@@ -98,13 +99,15 @@ def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
         spot["stock_code"] = spot["stock_code"].astype(str).str.zfill(6)
         spot["amount"] = pd.to_numeric(spot["amount"], errors="coerce")
         spot = spot[spot["stock_code"].str.match(r"^(6|0|3)\d{5}$")]
-        return spot.reset_index(drop=True)
+        if len(spot) >= 3000:
+            return spot.reset_index(drop=True)
+        print(f"  [清单] ⚠️ akshare spot_em 仅 {len(spot)} 只（<3000），视为残缺，降级 clist")
     except Exception as e:
         print(f"  [清单] akshare spot_em 失败，降级 clist: {e}")
     # 降级：东财 clist 分页
     try:
         rows_all, total = [], 0
-        for pn in range(1, 60):
+        for pn in range(1, 120):
             params = {"pn": pn, "pz": 100, "po": "1", "np": "1", "fltt": "2", "invt": "2",
                       "fid": "f6", "fs": FS_A, "fields": FIELDS_AMOUNT}
             r = _get_session().get(URL_CLIST, params=params, headers=HEADERS, timeout=30, proxies=proxies)
@@ -120,7 +123,9 @@ def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
                 "amount": pd.to_numeric(x.get("f6"), errors="coerce"),
             } for x in rows_all])
             df = df[df["stock_code"].str.match(r"^(6|0|3)\d{5}$")]
-            return df.reset_index(drop=True)
+            if len(df) >= 3000:
+                return df.reset_index(drop=True)
+            print(f"  [清单] ⚠️ clist 分页仅得 {len(df)} 只（<3000），视为残缺")
     except Exception as e:
         print(f"  [清单] clist 降级失败: {e}")
     # 再降级：fund_flow 快照并集（仅清单，无成交额）
@@ -132,7 +137,10 @@ def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
         except Exception:
             continue
     codes = {c.zfill(6) for c in codes if c.zfill(6)[0] in ("6", "0", "3")}
-    return pd.DataFrame({"stock_code": sorted(codes), "stock_name": "", "amount": float("nan")})
+    df = pd.DataFrame({"stock_code": sorted(codes), "stock_name": "", "amount": float("nan")})
+    if len(df) < 3000:
+        raise RuntimeError(f"全市场清单严重残缺（仅 {len(df)} 只），拒绝返回以防占比失真")
+    return df
 
 
 def load_stock_universe() -> pd.DataFrame:
@@ -243,13 +251,16 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
                 if failed <= 3:
                     print(f"  [回补] {code} 失败: {str(e)[:80]}")
 
-    # 逐日算占比 + 前5%明细
+    # 逐日算占比 + 前5%明细（单日股票数过少的天直接剔除，防残缺数据污染）
     new_rows = []
     detail_rows = []
     name_map = dict(zip(uni["stock_code"].astype(str).str.zfill(6), uni["stock_name"].astype(str)))
     for d in sorted(day_amounts):
         amts = pd.Series(day_amounts[d])
         row = compute_top5_pct(amts)
+        if row["stock_count"] < 3000:
+            print(f"  [回补] ⚠️ {d.strftime('%Y-%m-%d')} 仅 {row['stock_count']} 只有效，跳过该日")
+            continue
         new_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **row})
         for dr in _top5_detail_rows(amts, name_map):
             detail_rows.append({"trade_date": d.strftime("%Y-%m-%d"), **dr})
@@ -303,6 +314,9 @@ def update_amount_conc_daily(proxies: dict | None = None) -> bool:
     uni = fetch_stock_universe(proxies=proxies)
     if uni.empty or uni["amount"].isna().all():
         print("⚠️ 当日成交额获取失败，跳过增量")
+        return False
+    if int(uni["amount"].notna().sum()) < 3000:
+        print(f"⚠️ 当日仅 {int(uni['amount'].notna().sum())} 只有效成交额（<3000），清单残缺，拒绝落盘以防占比失真")
         return False
     date_str = pd.to_datetime(target).strftime("%Y-%m-%d")
     row = {"trade_date": date_str, **compute_top5_pct(uni["amount"])}
