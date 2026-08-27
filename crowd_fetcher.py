@@ -322,15 +322,17 @@ def update_amount_conc_daily(proxies: dict | None = None) -> bool:
 
 def ensure_crowd_history(proxies: dict | None = None) -> None:
     """更新流程入口：CSV 空/最新日期落后/明细缺失 → 回补；否则每日增量。供 run.py / cloud_update.py 复用。"""
-    from config import TOP5_DETAIL_CSV
     hist = load_amount_conc_hist()
     detail = load_top5_daily()
     try:
         latest_target = pd.to_datetime(_snapshot_date())
     except Exception:
         latest_target = None
-    detail_incomplete = (not detail.empty and not hist.empty
-                         and len(detail["trade_date"].unique()) < len(hist["trade_date"].unique()))
+    # 明细缺失（空 或 日期数 < 占比序列）→ 触发回补重建明细
+    detail_incomplete = True
+    if not hist.empty:
+        detail_incomplete = (detail.empty
+                             or len(detail["trade_date"].unique()) < len(hist["trade_date"].unique()))
     if hist.empty or latest_target is None or hist["trade_date"].max().normalize() < latest_target or detail_incomplete:
         backfill_amount_conc(days=int(os.environ.get("CROWD_LOOKBACK", "120")), proxies=proxies)
     else:
