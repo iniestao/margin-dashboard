@@ -51,12 +51,6 @@ def _qq_symbol(code: str) -> str:
     return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
 
 
-def _snapshot_date() -> str:
-    """最近一个已收盘交易日 YYYYMMDD"""
-    from fund_flow_fetcher import _snapshot_date as _ff_date
-    return _ff_date()
-
-
 def fetch_qq_kline_amount(code: str, proxies: dict | None = None) -> pd.DataFrame:
     """腾讯个股日线成交额（单请求返回最近 QQ_CNT 个交易日）。
 
@@ -193,10 +187,11 @@ def _top5_detail_rows(amount_series: pd.Series, name_map: dict | None = None) ->
 
 
 def _trading_dates(days: int) -> list:
-    """近 days 个交易日（datetime，升序）"""
+    """近 days 个交易日（datetime 升序）——**仅含 T-1 及以前**（排除当日，T 日数据 T+1 再取）"""
     from data_fetcher import _get_trading_dates
-    dts = _get_trading_dates(days)
-    return [pd.to_datetime(d) for d in sorted(dts)]
+    dts = [pd.to_datetime(d) for d in sorted(_get_trading_dates(days))]
+    today = pd.Timestamp(datetime.now().date())
+    return [d for d in dts if d < today]
 
 
 def backfill_amount_conc(days: int = 120, workers: int | None = None,
@@ -300,57 +295,13 @@ def _save_top5_detail(detail_rows: list[dict]) -> None:
     df_new.to_csv(TOP5_DETAIL_CSV, index=False)
 
 
-def update_amount_conc_daily(proxies: dict | None = None) -> bool:
-    """每日增量：当日全市场成交额（东财实时 1 请求）→ 前 5% 占比 → append CSV。
-
-    返回 True 表示新增了当日记录；CSV 已含当日则返回 False。
-    """
-    from config import CROWD_DIR, AMOUNT_CONC_CSV
-    CROWD_DIR.mkdir(parents=True, exist_ok=True)
-    target = _snapshot_date()
-    hist = load_amount_conc_hist()
-    if not hist.empty and hist["trade_date"].max().strftime("%Y%m%d") >= target:
-        return False
-    uni = fetch_stock_universe(proxies=proxies)
-    if uni.empty or uni["amount"].isna().all():
-        print("⚠️ 当日成交额获取失败，跳过增量")
-        return False
-    if int(uni["amount"].notna().sum()) < 3000:
-        print(f"⚠️ 当日仅 {int(uni['amount'].notna().sum())} 只有效成交额（<3000），清单残缺，拒绝落盘以防占比失真")
-        return False
-    date_str = pd.to_datetime(target).strftime("%Y-%m-%d")
-    row = {"trade_date": date_str, **compute_top5_pct(uni["amount"])}
-    df_new = pd.DataFrame([row])
-    if AMOUNT_CONC_CSV.exists():
-        old = pd.read_csv(AMOUNT_CONC_CSV)
-        df_new = pd.concat([old, df_new], ignore_index=True)
-    df_new = df_new.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    df_new.to_csv(AMOUNT_CONC_CSV, index=False)
-    # 当日前5%明细落盘
-    name_map = dict(zip(uni["stock_code"].astype(str).str.zfill(6), uni["stock_name"].astype(str)))
-    detail = [{"trade_date": date_str, **dr} for dr in _top5_detail_rows(uni["amount"], name_map)]
-    _save_top5_detail(detail)
-    print(f"✅ 拥挤度增量更新：{date_str} 前5%占比 {row['top5_pct']:.1f}%")
-    return True
-
-
 def ensure_crowd_history(proxies: dict | None = None) -> None:
-    """更新流程入口：CSV 空/最新日期落后/明细缺失 → 回补；否则每日增量。供 run.py / cloud_update.py 复用。"""
-    hist = load_amount_conc_hist()
-    detail = load_top5_daily()
-    try:
-        latest_target = pd.to_datetime(_snapshot_date())
-    except Exception:
-        latest_target = None
-    # 明细缺失（空 或 日期数 < 占比序列）→ 触发回补重建明细
-    detail_incomplete = True
-    if not hist.empty:
-        detail_incomplete = (detail.empty
-                             or len(detail["trade_date"].unique()) < len(hist["trade_date"].unique()))
-    if hist.empty or latest_target is None or hist["trade_date"].max().normalize() < latest_target or detail_incomplete:
-        backfill_amount_conc(days=int(os.environ.get("CROWD_LOOKBACK", "120")), proxies=proxies)
-    else:
-        update_amount_conc_daily(proxies=proxies)
+    """更新流程入口：确保近 120 交易日（T-1 口径）拥挤度数据齐全，缺失日用腾讯日线补齐。
+
+    backfill 内置断点续传：无缺失时秒级返回；有缺失时只补缺失日（T 日数据在 T+1 的
+    更新流程中随其他日更数据一起补齐，不再用当日实时快照）。
+    """
+    backfill_amount_conc(days=int(os.environ.get("CROWD_LOOKBACK", "120")), proxies=proxies)
 
 
 def load_amount_conc_hist() -> pd.DataFrame:

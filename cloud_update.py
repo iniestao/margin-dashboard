@@ -87,7 +87,7 @@ def main():
     if hist_codes:
         fetch_fund_flow_history(sorted(hist_codes), sorted(all_dates))
 
-    # 1.9 全市场成交集中度（拥挤度）更新：首次回补 120 日，之后每日增量
+    # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history
     try:
         ensure_crowd_history()
