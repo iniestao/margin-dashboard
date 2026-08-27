@@ -298,9 +298,21 @@ def _save_top5_detail(detail_rows: list[dict]) -> None:
 def ensure_crowd_history(proxies: dict | None = None) -> None:
     """更新流程入口：确保近 120 交易日（T-1 口径）拥挤度数据齐全，缺失日用腾讯日线补齐。
 
-    backfill 内置断点续传：无缺失时秒级返回；有缺失时只补缺失日（T 日数据在 T+1 的
-    更新流程中随其他日更数据一起补齐，不再用当日实时快照）。
+    两种情况触发回补：
+    1. 标量序列缺日 → 断点续传只补缺失日；
+    2. 明细天数 < 序列天数（换口径后需重建明细/清除污染数据）→ 清空缓存全量重建，
+       顺带剔除 T-1 口径之外的残留（如历史遗留的当日实时快照行）。
     """
+    from config import AMOUNT_CONC_CSV, TOP5_DETAIL_CSV
+    hist = load_amount_conc_hist()
+    detail = load_top5_daily()
+    n_hist = len(hist["trade_date"].unique()) if not hist.empty else 0
+    n_detail = len(detail["trade_date"].unique()) if not detail.empty else 0
+    if not hist.empty and n_detail < n_hist:
+        print(f">>> 拥挤度明细 {n_detail} 日 < 序列 {n_hist} 日 → 清空缓存全量重建")
+        for f in (AMOUNT_CONC_CSV, TOP5_DETAIL_CSV):
+            if f.exists():
+                f.unlink()
     backfill_amount_conc(days=int(os.environ.get("CROWD_LOOKBACK", "120")), proxies=proxies)
 
 
