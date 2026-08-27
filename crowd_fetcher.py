@@ -141,7 +141,9 @@ def load_stock_universe() -> pd.DataFrame:
     """读清单缓存 CSV；不存在返回空 DataFrame(columns=[stock_code, stock_name, as_of_date])"""
     from config import STOCK_UNIVERSE_CSV
     if STOCK_UNIVERSE_CSV.exists():
-        return pd.read_csv(STOCK_UNIVERSE_CSV)
+        df = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+        df["stock_code"] = df["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
+        return df
     return pd.DataFrame(columns=["stock_code", "stock_name", "as_of_date"])
 
 
@@ -327,11 +329,12 @@ def load_amount_conc_hist() -> pd.DataFrame:
 
 
 def load_top5_daily() -> pd.DataFrame:
-    """读前 5% 明细；返回 DataFrame(trade_date(datetime), stock_code, stock_name, amount, rank, share_pct)；缺失返回空。"""
+    """读前 5% 明细；返回 DataFrame(trade_date(datetime), stock_code(str 6位), stock_name, amount, rank, share_pct)；缺失返回空。"""
     from config import TOP5_DETAIL_CSV
     if not TOP5_DETAIL_CSV.exists():
         return pd.DataFrame(columns=["trade_date", "stock_code", "stock_name", "amount", "rank", "share_pct"])
-    df = pd.read_csv(TOP5_DETAIL_CSV)
+    df = pd.read_csv(TOP5_DETAIL_CSV, dtype={"stock_code": str})   # 强制字符串，防 000001 → 1
+    df["stock_code"] = df["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     return df.sort_values(["trade_date", "rank"]).reset_index(drop=True)
 
