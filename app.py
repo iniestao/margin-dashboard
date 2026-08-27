@@ -180,11 +180,11 @@ def crowding_label(pct) -> str:
     return "低拥挤"
 
 
-@st.cache_data(ttl=3600)
 def compute_fin_crowding(results: dict, window: int) -> pd.DataFrame:
     """147 指数融资余额近 window 日分位（窗口超历史自动取全部；列名标注实际历史长度）。
 
     返回 DataFrame：指数/代码/融资余额(亿)/近N日分位/拥挤度，按分位降序。
+    注：不缓存——results 为 147 指数大 dict，cache_data 序列化开销大且会过期重算。
     """
     rows = []
     for code, df in results.items():
@@ -207,9 +207,13 @@ def compute_fin_crowding(results: dict, window: int) -> pd.DataFrame:
 
 
 def load_crowd_amount_hist():
-    """全市场前 5% 成交额占比历史序列（CSV 缓存）"""
-    from crowd_fetcher import load_amount_conc_hist as _l
-    return _l()
+    """全市场前 5% 成交额占比历史序列（CSV 缓存）；读取失败返回空表，不抛异常"""
+    try:
+        from crowd_fetcher import load_amount_conc_hist as _l
+        return _l()
+    except Exception as e:
+        print(f"  [拥挤度] 读取成交集中度历史失败: {e}")
+        return pd.DataFrame(columns=["trade_date", "top5_pct", "total_amount", "top5_amount", "stock_count"])
 
 
 # ============================================================
@@ -1412,10 +1416,17 @@ with tab5:
     window_map = {"近1年(全部)": None, "120日": 120, "60日": 60, "20日": 20}
     window = window_map[w_opt]
 
-    amt_hist = load_crowd_amount_hist()
-    fin_crowd = None
-    if results:
-        fin_crowd = compute_fin_crowding(results, window if window else 10 ** 6)
+    try:
+        with st.status("拥挤度数据加载中…", expanded=False) as _s:
+            amt_hist = load_crowd_amount_hist()
+            fin_crowd = None
+            if results:
+                fin_crowd = compute_fin_crowding(results, window if window else 10 ** 6)
+            _s.update(label="拥挤度数据已加载", state="complete", expanded=False)
+    except Exception as e:
+        st.warning(f"拥挤度数据加载异常，请稍后重试：{str(e)[:120]}")
+        amt_hist = pd.DataFrame(columns=["trade_date", "top5_pct", "total_amount", "top5_amount", "stock_count"])
+        fin_crowd = None
     if not results:
         st.info("融资数据生成中，请稍候刷新（首次部署需先运行数据更新）")
     if amt_hist.empty:
