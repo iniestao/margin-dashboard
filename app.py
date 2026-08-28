@@ -1655,30 +1655,29 @@ with tab6:
             return fmt.format(v)
 
         def _bar_cell(v, vmax, fmt):
-            """双向数据条单元格：以单元格**中线**为起点，正贡献(红)向右延伸、负贡献(绿)向左延伸。
-            实现 = 左右两个半格 + 定宽纯色 div（最基础 CSS，必渲染）；数值贴在条末端。"""
+            """双向数据条单元格：以单元格**中线**为起点，正贡献(红)在右半格向右延伸、负贡献(绿)在左半格向左延伸。
+            结构 = [左半格(负值条贴右端=中线)] [右半格(正值条贴左端=中线)]，定宽纯色 div（必渲染）。"""
             try:
                 v = float(v)
             except (TypeError, ValueError):
                 return '<td style="text-align:right">-</td>'
             if v != v or vmax <= 0:
                 return '<td style="text-align:right">-</td>'
-            half = min(abs(v) / vmax, 1.0) * 50.0   # 占半格的百分比
-            if v >= 0:
-                color, bar = "#E24B4A", f'<div style="width:{half:.0f}%;height:12px;background:#E24B4A;border-radius:2px"></div>'
-                valign = "flex-start"
-            else:
-                color, bar = "#2E8B57", f'<div style="width:{half:.0f}%;height:12px;background:#2E8B57;border-radius:2px"></div>'
-                valign = "flex-end"
+            half = min(abs(v) / vmax, 1.0) * 100.0   # 占半格的百分比
+            color = "#E24B4A" if v >= 0 else "#2E8B57"
+            bar = f'<div style="width:{half:.0f}%;height:12px;background:{color};border-radius:2px"></div>'
             num = f'<span style="font-size:12px;margin:0 4px;color:{pct_color(v)};white-space:nowrap">{fmt.format(v)}</span>'
             if v >= 0:
-                inner = bar + num
+                # 正值：条在右半格，从中线向右；数值贴条右侧
+                left = '<div style="width:50%"></div>'
+                right = f'<div style="width:50%;display:flex;align-items:center">{bar}{num}</div>'
             else:
-                inner = num + bar
+                # 负值：条在左半格，从中线向左；数值贴条左侧
+                left = f'<div style="width:50%;display:flex;align-items:center;justify-content:flex-end">{num}{bar}</div>'
+                right = '<div style="width:50%"></div>'
             return (f'<td style="padding:2px 4px">'
                     f'<div style="display:flex;align-items:center;background:#F0F1F3;border-radius:3px;height:16px">'
-                    f'<div style="width:50%;display:flex;justify-content:{valign};overflow:hidden">{inner}</div>'
-                    f'<div style="width:50%"></div>'
+                    f'{left}{right}'
                     f'</div></td>')
 
         # 列最大绝对值（数据条长度基准）
@@ -1704,11 +1703,28 @@ with tab6:
                 + _bar_cell(r["昨日涨跌幅%"], vmax_yd, "{:+.2f}")
                 + _bar_cell(r["昨日贡献点"], vmax_yc, "{:+.3f}") + "</tr>")
 
-        table_html = f"""<div style="max-height:560px;overflow-y:auto;border:1px solid #E8EAED;border-radius:8px">
+        # vmax NaN 防护（昨日列可能全 NaN → width:nan% 导致条不可见）
+        def _safe_vmax(x):
+            try:
+                x = float(x)
+                return x if x == x and x > 0 else 1.0
+            except (TypeError, ValueError):
+                return 1.0
+        vmax_rt = _safe_vmax(vmax_rt)
+        vmax_cont = _safe_vmax(vmax_cont)
+        vmax_yd = _safe_vmax(vmax_yd)
+        vmax_yc = _safe_vmax(vmax_yc)
+
+        table_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+        <body style="margin:0;background:#fff">
+        <div style="max-height:560px;overflow-y:auto;border:1px solid #E8EAED;border-radius:8px">
         <table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:'Microsoft YaHei',sans-serif">
         <thead><tr style="background:#F5F6F8">{head}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody></table></div>"""
-        st.markdown(table_html, unsafe_allow_html=True)
+        <tbody>{''.join(rows_html)}</tbody></table></div></body></html>"""
+        # 用 components.html 渲染（iframe 零过滤）——st.markdown 的 sanitizer 会剥掉
+        # background 渐变等 CSS，导致数据条不显示
+        import streamlit.components.v1 as components
+        components.html(table_html, height=580, scrolling=False)
         st.caption(f"权重快照：{est_data['wdate']} · 数据条长度∝绝对值：绿=正/涨、红=负/跌；按权重降序 · 涨跌幅为当日实时，昨日列为上一交易日实际值")
 
 
