@@ -1595,7 +1595,7 @@ with tab6:
         st.markdown("### 成分股贡献明细")
         tbl = m[["stock_code", "stock_name", "权重%", "涨跌幅", "实时成交额(亿)", "贡献点"]].copy()
         tbl.columns = ["代码", "名称", "权重%", "实时涨跌幅%", "实时成交额(亿)", "贡献点"]
-        tbl = tbl.sort_values("贡献点", ascending=False)
+        tbl = tbl.sort_values("权重%", ascending=False)
 
         def _css_color(v):
             try:
@@ -1604,12 +1604,31 @@ with tab6:
                 return ""
             return f"color: {c};" if c else ""
 
-        styler = tbl.style.map(_css_color, subset=["实时涨跌幅%"]) \
-                          .format({"权重%": "{:.3f}", "实时涨跌幅%": "{:+.2f}",
-                                   "实时成交额(亿)": "{:.2f}", "贡献点": "{:+.3f}"}) \
-                          .bar(subset=["贡献点"], align="zero", color=["#f5a9a9", "#9fd8a8"]) \
-                          .bar(subset=["实时涨跌幅%"], align="zero", color=["#f5a9a9", "#9fd8a8"])
-        st.caption(f"权重快照：{est_data['wdate']} · 数据条以 0 为中心：红=拉低指数、绿=拉升指数；按贡献点降序")
+        def _bar_css_factory(col):
+            """Excel 风格数据条：条长 ∝ |值|/列最大绝对值，正=绿、负=红（手写渐变，兼容 st.dataframe）"""
+            vmax = float(tbl[col].abs().max()) if not tbl.empty else 0.0
+            if not vmax or vmax != vmax or vmax == 0:
+                return lambda v: ""
+
+            def f(v):
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    return ""
+                if v != v:
+                    return ""
+                ratio = min(abs(v) / vmax, 1.0) * 100
+                color = "#63BE7B" if v >= 0 else "#F8696B"
+                return f"background: linear-gradient(90deg, {color} {ratio:.0f}%, transparent {ratio:.0f}%);"
+            return f
+
+        styler = (tbl.style
+                  .map(_css_color, subset=["实时涨跌幅%"])
+                  .map(_bar_css_factory("贡献点"), subset=["贡献点"])
+                  .map(_bar_css_factory("实时涨跌幅%"), subset=["实时涨跌幅%"])
+                  .format({"权重%": "{:.3f}", "实时涨跌幅%": "{:+.2f}",
+                           "实时成交额(亿)": "{:.2f}", "贡献点": "{:+.3f}"}))
+        st.caption(f"权重快照：{est_data['wdate']} · 数据条长度∝绝对值（Excel 同款）：绿=正贡献/涨、红=负贡献/跌；按权重降序")
         st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
 
 
