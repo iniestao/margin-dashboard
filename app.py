@@ -17,7 +17,7 @@ from etf_fetcher import (load_etf_scale_cache as _load_etf_scale_cache,
                          compute_etf_amount,
                          NATIONAL_TEAM_ETF)
 from fund_flow_fetcher import load_fund_flow_cache
-from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime,
+from realtime_fetcher import (fetch_index_quotes, fetch_stock_flow_realtime, fetch_index_close_sina,
                               index_secid,
                               fetch_index_kline_close, fetch_index_volume_history,
                               aggregate_flow_realtime, build_index_map, get_proxies,
@@ -606,7 +606,7 @@ if not etf_scale.empty and not etf_nav.empty:
 
 st.markdown("""<h1>A股资金监控看板</h1>""", unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向", "实时行情", "拥挤度"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["A股指数融资额", "ETF份额监控", "资金流向", "实时行情", "拥挤度", "指数实时估算"])
 
 # ============================================================
 #  Tab 1: A股指数融资额（原有全部内容）
@@ -1511,9 +1511,110 @@ with tab5:
         st.warning(f"拥挤度渲染异常，已跳过部分内容：{str(e)[:120]}")
 
 
+# ============================================================
+#  Tab 6: 指数实时估算（成分股权重加权）
+# ============================================================
+with tab6:
+    st.markdown("### 指数实时估算")
+    st.caption("口径：贡献点 = 个股实时涨跌幅 × 归一化权重；指数估算涨跌幅 = Σ贡献点（与 Excel「指数实时估算」同算法）。"
+               "同时展示指数实际涨跌幅（实时）与上一交易日实际涨跌幅对比；权重快照日期见明细表标注。")
+
+    idx_list = discover_all_indices()
+    _idx_names = dict(idx_list)
+    sel6 = st.selectbox("选择指数（挂钩 ETF）", [c for c, _ in idx_list],
+                        index=0,
+                        format_func=lambda c: f"{_idx_names.get(c, c)}（{c}）",
+                        key="tab6_idx")
+
+    def _estimate_index(index_code: str) -> dict:
+        """成分股权重加权估算指数实时涨跌幅 + 实际值 + 昨日值"""
+        w = load_index_weights(index_code).copy()
+        w["stock_code"] = w["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
+        w["weight_pct"] = pd.to_numeric(w["weight_pct"], errors="coerce")
+        w = w.dropna(subset=["weight_pct"])
+        w["w_norm"] = w["weight_pct"] / w["weight_pct"].sum()
+
+        rt = fetch_stock_flow_realtime(w["stock_code"].tolist())
+        m = w.merge(rt[["stock_code", "stock_name", "price", "pct_chg", "amount"]],
+                    on="stock_code", how="left", suffixes=("", "_rt"))
+        m["涨跌幅"] = pd.to_numeric(m["pct_chg"], errors="coerce")
+        m["贡献点"] = (m["涨跌幅"] * m["w_norm"]).fillna(0.0)
+        m["权重%"] = (m["w_norm"] * 100).round(3)
+        m["实时成交额(亿)"] = (pd.to_numeric(m["amount"], errors="coerce") / 1e8).round(2)
+        est = float(m["贡献点"].sum())
+        covered = float(m.loc[m["涨跌幅"].notna(), "w_norm"].sum() * 100)
+
+        act = None
+        q = fetch_index_quotes([index_code])
+        if not q.empty:
+            act = float(q.iloc[0]["pct_chg"])
+        yday = None
+        closes = fetch_index_close_sina(index_code, days=10)
+        if len(closes) >= 2:
+            yday = (float(closes["close"].iloc[-1]) / float(closes["close"].iloc[-2]) - 1) * 100
+        return {"detail": m, "est": est, "act": act, "yday": yday,
+                "covered": covered, "wdate": w["date"].iloc[0] if "date" in w.columns else "-"}
+
+    est_data = None
+    try:
+        with st.status("拉取成分股实时行情并估算…", expanded=True) as _s6:
+            est_data = _estimate_index(sel6)
+            _s6.update(label="估算完成", state="complete", expanded=False)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        st.warning(f"指数估算异常：{str(e)[:150]}")
+
+    if est_data:
+        m, est, act, yday, cov = (est_data["detail"], est_data["est"], est_data["act"],
+                                  est_data["yday"], est_data["covered"])
+        # ── 卡片 ──
+        e1, e2, e3, e4 = st.columns(4, gap="medium")
+        with e1:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">估算涨跌幅（加权）</div>
+            <div class="metric-value" style="font-size:20px;color:{pct_color(est)}">{est:+.2f}%</div>
+            <div class="metric-sub">成分股覆盖 {cov:.1f}% 权重</div></div>""", unsafe_allow_html=True)
+        with e2:
+            act_txt = f"{act:+.2f}%" if act is not None else "-"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">指数实际涨跌幅</div>
+            <div class="metric-value" style="font-size:20px;color:{pct_color(act) if act is not None else '#AAA'}">{act_txt}</div>
+            <div class="metric-sub">实时（东财）</div></div>""", unsafe_allow_html=True)
+        with e3:
+            diff = (est - act) if act is not None else None
+            d_txt = f"{diff:+.2f}pp" if diff is not None else "-"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">估算-实际偏差</div>
+            <div class="metric-value" style="font-size:20px;color:{pct_color(diff) if diff is not None else '#AAA'}">{d_txt}</div>
+            <div class="metric-sub">负值=估算低估</div></div>""", unsafe_allow_html=True)
+        with e4:
+            y_txt = f"{yday:+.2f}%" if yday is not None else "-"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">上一交易日实际</div>
+            <div class="metric-value" style="font-size:20px;color:{pct_color(yday) if yday is not None else '#AAA'}">{y_txt}</div>
+            <div class="metric-sub">昨日实际涨跌幅</div></div>""", unsafe_allow_html=True)
+
+        # ── 成分股明细（数据条）──
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        st.markdown("### 成分股贡献明细")
+        tbl = m[["stock_code", "stock_name", "权重%", "涨跌幅", "实时成交额(亿)", "贡献点"]].copy()
+        tbl.columns = ["代码", "名称", "权重%", "实时涨跌幅%", "实时成交额(亿)", "贡献点"]
+        tbl = tbl.sort_values("贡献点", ascending=False)
+
+        def _css_color(v):
+            try:
+                c = pct_color(float(v))
+            except (TypeError, ValueError):
+                return ""
+            return f"color: {c};" if c else ""
+
+        styler = tbl.style.map(_css_color, subset=["实时涨跌幅%"]) \
+                          .format({"权重%": "{:.3f}", "实时涨跌幅%": "{:+.2f}",
+                                   "实时成交额(亿)": "{:.2f}", "贡献点": "{:+.3f}"}) \
+                          .bar(subset=["贡献点"], align="zero", color=["#f5a9a9", "#9fd8a8"]) \
+                          .bar(subset=["实时涨跌幅%"], align="zero", color=["#f5a9a9", "#9fd8a8"])
+        st.caption(f"权重快照：{est_data['wdate']} · 数据条以 0 为中心：红=拉低指数、绿=拉升指数；按贡献点降序")
+        st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
+
 
 st.markdown("""
 <div style='text-align:center;padding:32px 0 16px 0;color:#bbb;font-size:11px;border-top:1px solid #eee;margin-top:32px'>
-    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向 · 实时行情 · 拥挤度
+    A股资金监控看板 · 指数成分股融资余额汇总 · ETF份额监控 · 资金流向 · 实时行情 · 拥挤度 · 指数实时估算
 </div>
 """, unsafe_allow_html=True)

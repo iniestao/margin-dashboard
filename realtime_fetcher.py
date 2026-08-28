@@ -302,6 +302,25 @@ def _sina_index_symbol(secid: str) -> str:
     return f"sh{code}"
 
 
+def fetch_index_close_sina(index_code: str, days: int = 10) -> pd.DataFrame:
+    """指数日线收盘（新浪源，公网稳定）。
+
+    返回 DataFrame(trade_date(datetime 旧→新), close)；失败返回空。
+    用于"上一交易日涨跌幅"等非实时历史点位（东财 push2his 被限制时的备用源）。
+    """
+    try:
+        import akshare as ak
+        sym = _sina_index_symbol(index_secid(index_code))
+        k = ak.stock_zh_index_daily(symbol=sym)
+        k = k.tail(days)
+        df = pd.DataFrame({"trade_date": pd.to_datetime(k["date"]),
+                           "close": pd.to_numeric(k["close"], errors="coerce")}).dropna()
+        return df.sort_values("trade_date").reset_index(drop=True)
+    except Exception as e:
+        print(f"  [指数收盘] {index_code} 新浪源失败: {e}")
+        return pd.DataFrame(columns=["trade_date", "close"])
+
+
 def fetch_index_volume_history(secids: list[str], days: int = 5,
                                max_workers: int = 6) -> dict:
     """指数近 N 日历史**成交量（手）**（新浪源，公网稳定；东财 push2his 常被限制）。
