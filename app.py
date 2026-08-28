@@ -188,6 +188,43 @@ def load_top5_detail_data():
         return pd.DataFrame(columns=["trade_date", "stock_code", "stock_name", "amount", "rank", "share_pct"])
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_pct_yday_cached(index_code: str, codes: tuple) -> dict:
+    """上一交易日各成分股涨跌幅（腾讯日线，按指数+代码缓存，首次约 1 分钟）。
+
+    返回 {code6: 昨日涨跌幅%}；拉取失败的股票不含在结果中。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from crowd_fetcher import fetch_qq_kline_amount
+
+    # 目标日期 = T-1（最近的、已完整收盘的交易日，排除今天）
+    from crowd_fetcher import _trading_dates
+    targets = _trading_dates(5)
+    if not targets:
+        return {}
+    target = targets[-1]
+
+    def _get(c):
+        df = fetch_qq_kline_amount(c)
+        row = df[df["trade_date"].dt.normalize() == target]
+        if row.empty:
+            return c, None
+        pc = row.iloc[0]["pct_chg"]
+        return c, (float(pc) if pd.notna(pc) else None)
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = [ex.submit(_get, c) for c in codes]
+        for fut in as_completed(futs):
+            try:
+                c, v = fut.result()
+                if v is not None:
+                    out[c] = v
+            except Exception:
+                continue
+    return out
+
+
 # ============================================================
 #  ETF 份额 / 金额
 # ============================================================
@@ -1567,8 +1604,8 @@ with tab6:
     if est_data:
         m, est, act, yday, cov = (est_data["detail"], est_data["est"], est_data["act"],
                                   est_data["yday"], est_data["covered"])
-        # ── 卡片 ──
-        e1, e2, e3, e4 = st.columns(4, gap="medium")
+        # ── 卡片（3 个，昨日情况在明细表中展示）──
+        e1, e2, e3 = st.columns(3, gap="medium")
         with e1:
             st.markdown(f"""<div class="metric-card"><div class="metric-label">估算涨跌幅（加权）</div>
             <div class="metric-value" style="font-size:20px;color:{pct_color(est)}">{est:+.2f}%</div>
@@ -1584,52 +1621,78 @@ with tab6:
             st.markdown(f"""<div class="metric-card"><div class="metric-label">估算-实际偏差</div>
             <div class="metric-value" style="font-size:20px;color:{pct_color(diff) if diff is not None else '#AAA'}">{d_txt}</div>
             <div class="metric-sub">负值=估算低估</div></div>""", unsafe_allow_html=True)
-        with e4:
-            y_txt = f"{yday:+.2f}%" if yday is not None else "-"
-            st.markdown(f"""<div class="metric-card"><div class="metric-label">上一交易日实际</div>
-            <div class="metric-value" style="font-size:20px;color:{pct_color(yday) if yday is not None else '#AAA'}">{y_txt}</div>
-            <div class="metric-sub">昨日实际涨跌幅</div></div>""", unsafe_allow_html=True)
 
-        # ── 成分股明细（数据条）──
+        # ── 成分股明细（HTML 表格 + 真数据条 + 昨日对比列）──
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-        st.markdown("### 成分股贡献明细")
+        st.markdown("### 成分股贡献明细（含上一交易日对比）")
         tbl = m[["stock_code", "stock_name", "权重%", "涨跌幅", "实时成交额(亿)", "贡献点"]].copy()
         tbl.columns = ["代码", "名称", "权重%", "实时涨跌幅%", "实时成交额(亿)", "贡献点"]
-        tbl = tbl.sort_values("权重%", ascending=False)
+        tbl = tbl.sort_values("权重%", ascending=False).reset_index(drop=True)
+        tbl.insert(0, "序号", tbl.index + 1)
 
-        def _css_color(v):
+        # 昨日各成分股涨跌幅（腾讯日线，按指数缓存，首次约 1 分钟）
+        with st.status("拉取上一交易日成分股数据…（首次约 1 分钟，之后有缓存）", expanded=True) as _sy:
             try:
-                c = pct_color(float(v))
+                yday_map = fetch_stock_pct_yday_cached(sel6, tuple(tbl["代码"]))
+            except Exception as e:
+                print(f"  [估算] 昨日数据失败: {e}")
+                yday_map = {}
+            _sy.update(label="上一交易日数据已加载", state="complete", expanded=False)
+        tbl["昨日涨跌幅%"] = tbl["代码"].map(lambda c: yday_map.get(c))
+        tbl["昨日贡献点"] = (tbl["昨日涨跌幅%"] * tbl["权重%"] / 100).round(3)
+
+        def _bar(v, vmax):
+            """Excel 风格数据条背景（条长∝|v|/列最大）"""
+            try:
+                v = float(v)
             except (TypeError, ValueError):
                 return ""
-            return f"color: {c};" if c else ""
+            if v != v or vmax <= 0:
+                return ""
+            ratio = min(abs(v) / vmax, 1.0) * 100
+            color = "#63BE7B" if v >= 0 else "#F8696B"
+            return f"background: linear-gradient(90deg, {color} {ratio:.0f}%, transparent {ratio:.0f}%);"
 
-        def _bar_css_factory(col):
-            """Excel 风格数据条：条长 ∝ |值|/列最大绝对值，正=绿、负=红（手写渐变，兼容 st.dataframe）"""
-            vmax = float(tbl[col].abs().max()) if not tbl.empty else 0.0
-            if not vmax or vmax != vmax or vmax == 0:
-                return lambda v: ""
+        def _fmt_cell(v, fmt):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return "-"
+            return fmt.format(v)
 
-            def f(v):
-                try:
-                    v = float(v)
-                except (TypeError, ValueError):
-                    return ""
-                if v != v:
-                    return ""
-                ratio = min(abs(v) / vmax, 1.0) * 100
-                color = "#63BE7B" if v >= 0 else "#F8696B"
-                return f"background: linear-gradient(90deg, {color} {ratio:.0f}%, transparent {ratio:.0f}%);"
-            return f
+        # 列最大绝对值（数据条长度基准）
+        vmax_rt = float(tbl["实时涨跌幅%"].abs().max()) if len(tbl) else 0.0
+        vmax_cont = float(tbl["贡献点"].abs().max()) if len(tbl) else 0.0
+        vmax_yd = float(tbl["昨日涨跌幅%"].abs().max()) if len(tbl) else 0.0
+        vmax_yc = float(tbl["昨日贡献点"].abs().max()) if len(tbl) else 0.0
 
-        styler = (tbl.style
-                  .map(_css_color, subset=["实时涨跌幅%"])
-                  .map(_bar_css_factory("贡献点"), subset=["贡献点"])
-                  .map(_bar_css_factory("实时涨跌幅%"), subset=["实时涨跌幅%"])
-                  .format({"权重%": "{:.3f}", "实时涨跌幅%": "{:+.2f}",
-                           "实时成交额(亿)": "{:.2f}", "贡献点": "{:+.3f}"}))
-        st.caption(f"权重快照：{est_data['wdate']} · 数据条长度∝绝对值（Excel 同款）：绿=正贡献/涨、红=负贡献/跌；按权重降序")
-        st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
+        head = """<tr><th style="text-align:center">序号</th><th>代码</th><th>名称</th>
+                  <th style="text-align:right">权重%</th>
+                  <th style="text-align:right">实时涨跌幅%</th><th style="text-align:right">实时成交额(亿)</th>
+                  <th style="text-align:right">贡献点</th>
+                  <th style="text-align:right">昨日涨跌幅%</th><th style="text-align:right">昨日贡献点</th></tr>"""
+        rows_html = []
+        for _, r in tbl.iterrows():
+            td_bar = lambda v, vmax, fmt: (
+                f'<td style="text-align:right;background:{_bar(v, vmax)};color:{pct_color(float(v))}">{_fmt_cell(v, fmt)}</td>'
+                if v is not None and v == v and str(v) != "nan" else
+                '<td style="text-align:right">-</td>')
+            rows_html.append(
+                f'<tr><td style="text-align:center">{int(r["序号"])}</td>'
+                f'<td>{r["代码"]}</td><td>{r["名称"]}</td>'
+                f'<td style="text-align:right">{_fmt_cell(r["权重%"], "{:.3f}")}</td>'
+                + td_bar(r["实时涨跌幅%"], vmax_rt, "{:+.2f}")
+                + f'<td style="text-align:right">{_fmt_cell(r["实时成交额(亿)"], "{:.2f}")}</td>'
+                + td_bar(r["贡献点"], vmax_cont, "{:+.3f}")
+                + td_bar(r["昨日涨跌幅%"], vmax_yd, "{:+.2f}")
+                + td_bar(r["昨日贡献点"], vmax_yc, "{:+.3f}") + "</tr>")
+
+        table_html = f"""<div style="max-height:560px;overflow-y:auto;border:1px solid #E8EAED;border-radius:8px">
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:'Microsoft YaHei',sans-serif">
+        <thead><tr style="background:#F5F6F8">{head}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody></table></div>"""
+        st.markdown(table_html, unsafe_allow_html=True)
+        st.caption(f"权重快照：{est_data['wdate']} · 数据条长度∝绝对值：绿=正/涨、红=负/跌；按权重降序 · 涨跌幅为当日实时，昨日列为上一交易日实际值")
 
 
 st.markdown("""
