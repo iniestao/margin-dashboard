@@ -190,9 +190,10 @@ def load_top5_detail_data():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_pct_yday_cached(index_code: str, codes: tuple) -> dict:
-    """上一交易日各成分股涨跌幅（腾讯日线，按指数+代码缓存，首次约 1 分钟）。
+    """上一交易日各成分股涨跌幅（腾讯日线，个股级缓存跨指数共享，首次约 20-40 秒）。
 
     返回 {code6: 昨日涨跌幅%}；拉取失败的股票不含在结果中。
+    只拉最近 15 行（传输量小）+ 24 并发。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from crowd_fetcher import fetch_qq_kline_amount
@@ -205,7 +206,7 @@ def fetch_stock_pct_yday_cached(index_code: str, codes: tuple) -> dict:
     target = targets[-1]
 
     def _get(c):
-        df = fetch_qq_kline_amount(c)
+        df = fetch_qq_kline_amount(c, cnt=15)
         row = df[df["trade_date"].dt.normalize() == target]
         if row.empty:
             return c, None
@@ -213,7 +214,7 @@ def fetch_stock_pct_yday_cached(index_code: str, codes: tuple) -> dict:
         return c, (float(pc) if pd.notna(pc) else None)
 
     out = {}
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=24) as ex:
         futs = [ex.submit(_get, c) for c in codes]
         for fut in as_completed(futs):
             try:
@@ -1654,23 +1655,30 @@ with tab6:
             return fmt.format(v)
 
         def _bar_cell(v, vmax, fmt):
-            """Excel 式数据条单元格：嵌套纯色 div（width% 控制条长），正绿负红，
-            正值条靠左、负值条靠右——纯 width/background-color，任何渲染器都显示"""
+            """双向数据条单元格：以单元格**中线**为起点，正贡献(红)向右延伸、负贡献(绿)向左延伸。
+            实现 = 左右两个半格 + 定宽纯色 div（最基础 CSS，必渲染）；数值贴在条末端。"""
             try:
                 v = float(v)
             except (TypeError, ValueError):
                 return '<td style="text-align:right">-</td>'
             if v != v or vmax <= 0:
                 return '<td style="text-align:right">-</td>'
-            ratio = min(abs(v) / vmax, 1.0) * 100
-            color = "#63BE7B" if v >= 0 else "#F8696B"
-            justify = "flex-start" if v >= 0 else "flex-end"
-            return (f'<td style="padding:2px 6px">'
-                    f'<div style="display:flex;align-items:center;justify-content:{justify};'
-                    f'background:#F0F1F3;border-radius:3px;height:16px;min-width:90px">'
-                    f'<div style="width:{ratio:.0f}%;background:{color};height:12px;'
-                    f'border-radius:2px"></div>'
-                    f'<span style="font-size:12px;margin:0 4px;color:{pct_color(v)}">{fmt.format(v)}</span>'
+            half = min(abs(v) / vmax, 1.0) * 50.0   # 占半格的百分比
+            if v >= 0:
+                color, bar = "#E24B4A", f'<div style="width:{half:.0f}%;height:12px;background:#E24B4A;border-radius:2px"></div>'
+                valign = "flex-start"
+            else:
+                color, bar = "#2E8B57", f'<div style="width:{half:.0f}%;height:12px;background:#2E8B57;border-radius:2px"></div>'
+                valign = "flex-end"
+            num = f'<span style="font-size:12px;margin:0 4px;color:{pct_color(v)};white-space:nowrap">{fmt.format(v)}</span>'
+            if v >= 0:
+                inner = bar + num
+            else:
+                inner = num + bar
+            return (f'<td style="padding:2px 4px">'
+                    f'<div style="display:flex;align-items:center;background:#F0F1F3;border-radius:3px;height:16px">'
+                    f'<div style="width:50%;display:flex;justify-content:{valign};overflow:hidden">{inner}</div>'
+                    f'<div style="width:50%"></div>'
                     f'</div></td>')
 
         # 列最大绝对值（数据条长度基准）

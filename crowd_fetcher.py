@@ -51,15 +51,17 @@ def _qq_symbol(code: str) -> str:
     return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
 
 
-def fetch_qq_kline_amount(code: str, proxies: dict | None = None) -> pd.DataFrame:
-    """腾讯个股日线成交额（单请求返回最近 QQ_CNT 个交易日）。
+def fetch_qq_kline_amount(code: str, proxies: dict | None = None,
+                          cnt: int = QQ_CNT) -> pd.DataFrame:
+    """腾讯个股日线成交额+涨跌幅（单请求返回最近 cnt 个交易日）。
 
-    返回 DataFrame(trade_date(datetime, 旧→新), amount(元))；失败抛异常由上层重试。
+    返回 DataFrame(trade_date, amount(元), pct_chg(%))；失败抛异常由上层重试。
+    cnt 可调小（如 15）减少传输量——只需最近几天时大幅提速。
     """
     sym = _qq_symbol(code)
-    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=max(cnt * 2, 60))).strftime("%Y-%m-%d")
     end = datetime.now().strftime("%Y-%m-%d")
-    params = {"param": f"{sym},day,{start},{end},{QQ_CNT},qfq"}
+    params = {"param": f"{sym},day,{start},{end},{cnt},qfq"}
     r = _get_session().get(URL_QQ_KLINE, params=params, headers=HEADERS, timeout=20, proxies=proxies)
     r.raise_for_status()
     data = ((r.json().get("data") or {}).get(sym)) or {}
