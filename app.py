@@ -1555,7 +1555,7 @@ with tab5:
 with tab6:
     st.markdown("### 指数实时估算")
     st.caption("口径：贡献点 = 个股实时涨跌幅 × 归一化权重；指数估算涨跌幅 = Σ贡献点。"
-               "同时展示指数实际涨跌幅（实时）与上一交易日实际涨跌幅对比；权重快照日期见明细表标注。")
+               "同时展示指数实际涨跌幅（实时）与上一交易日实际涨跌幅对比。")
 
     idx_list = discover_all_indices()
     _idx_names = dict(idx_list)
@@ -1725,7 +1725,7 @@ with tab6:
         # background 渐变等 CSS，导致数据条不显示
         import streamlit.components.v1 as components
         components.html(table_html, height=580, scrolling=False)
-        st.caption(f"权重快照：{est_data['wdate']} · 数据条长度∝绝对值：绿=正/涨、红=负/跌；按权重降序 · 涨跌幅为当日实时，昨日列为上一交易日实际值")
+        st.caption(f"权重快照：{est_data['wdate']} ")
 
 
 st.markdown("""
