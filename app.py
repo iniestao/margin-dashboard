@@ -1604,8 +1604,8 @@ with tab6:
     if est_data:
         m, est, act, yday, cov = (est_data["detail"], est_data["est"], est_data["act"],
                                   est_data["yday"], est_data["covered"])
-        # ── 卡片（3 个，昨日情况在明细表中展示）──
-        e1, e2, e3 = st.columns(3, gap="medium")
+        # ── 卡片（4 个：估算/实际/偏差/昨日实际）──
+        e1, e2, e3, e4 = st.columns(4, gap="medium")
         with e1:
             st.markdown(f"""<div class="metric-card"><div class="metric-label">估算涨跌幅（加权）</div>
             <div class="metric-value" style="font-size:20px;color:{pct_color(est)}">{est:+.2f}%</div>
@@ -1621,6 +1621,11 @@ with tab6:
             st.markdown(f"""<div class="metric-card"><div class="metric-label">估算-实际偏差</div>
             <div class="metric-value" style="font-size:20px;color:{pct_color(diff) if diff is not None else '#AAA'}">{d_txt}</div>
             <div class="metric-sub">负值=估算低估</div></div>""", unsafe_allow_html=True)
+        with e4:
+            y_txt = f"{yday:+.2f}%" if yday is not None else "-"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">指数昨日涨跌幅</div>
+            <div class="metric-value" style="font-size:20px;color:{pct_color(yday) if yday is not None else '#AAA'}">{y_txt}</div>
+            <div class="metric-sub">上一交易日实际</div></div>""", unsafe_allow_html=True)
 
         # ── 成分股明细（HTML 表格 + 真数据条 + 昨日对比列）──
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
@@ -1641,24 +1646,32 @@ with tab6:
         tbl["昨日涨跌幅%"] = tbl["代码"].map(lambda c: yday_map.get(c))
         tbl["昨日贡献点"] = (tbl["昨日涨跌幅%"] * tbl["权重%"] / 100).round(3)
 
-        def _bar(v, vmax):
-            """Excel 风格数据条背景（条长∝|v|/列最大）"""
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                return ""
-            if v != v or vmax <= 0:
-                return ""
-            ratio = min(abs(v) / vmax, 1.0) * 100
-            color = "#63BE7B" if v >= 0 else "#F8696B"
-            return f"background: linear-gradient(90deg, {color} {ratio:.0f}%, transparent {ratio:.0f}%);"
-
         def _fmt_cell(v, fmt):
             try:
                 v = float(v)
             except (TypeError, ValueError):
                 return "-"
             return fmt.format(v)
+
+        def _bar_cell(v, vmax, fmt):
+            """Excel 式数据条单元格：嵌套纯色 div（width% 控制条长），正绿负红，
+            正值条靠左、负值条靠右——纯 width/background-color，任何渲染器都显示"""
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return '<td style="text-align:right">-</td>'
+            if v != v or vmax <= 0:
+                return '<td style="text-align:right">-</td>'
+            ratio = min(abs(v) / vmax, 1.0) * 100
+            color = "#63BE7B" if v >= 0 else "#F8696B"
+            justify = "flex-start" if v >= 0 else "flex-end"
+            return (f'<td style="padding:2px 6px">'
+                    f'<div style="display:flex;align-items:center;justify-content:{justify};'
+                    f'background:#F0F1F3;border-radius:3px;height:16px;min-width:90px">'
+                    f'<div style="width:{ratio:.0f}%;background:{color};height:12px;'
+                    f'border-radius:2px"></div>'
+                    f'<span style="font-size:12px;margin:0 4px;color:{pct_color(v)}">{fmt.format(v)}</span>'
+                    f'</div></td>')
 
         # 列最大绝对值（数据条长度基准）
         vmax_rt = float(tbl["实时涨跌幅%"].abs().max()) if len(tbl) else 0.0
@@ -1673,19 +1686,15 @@ with tab6:
                   <th style="text-align:right">昨日涨跌幅%</th><th style="text-align:right">昨日贡献点</th></tr>"""
         rows_html = []
         for _, r in tbl.iterrows():
-            td_bar = lambda v, vmax, fmt: (
-                f'<td style="text-align:right;background:{_bar(v, vmax)};color:{pct_color(float(v))}">{_fmt_cell(v, fmt)}</td>'
-                if v is not None and v == v and str(v) != "nan" else
-                '<td style="text-align:right">-</td>')
             rows_html.append(
                 f'<tr><td style="text-align:center">{int(r["序号"])}</td>'
                 f'<td>{r["代码"]}</td><td>{r["名称"]}</td>'
                 f'<td style="text-align:right">{_fmt_cell(r["权重%"], "{:.3f}")}</td>'
-                + td_bar(r["实时涨跌幅%"], vmax_rt, "{:+.2f}")
+                + _bar_cell(r["实时涨跌幅%"], vmax_rt, "{:+.2f}")
                 + f'<td style="text-align:right">{_fmt_cell(r["实时成交额(亿)"], "{:.2f}")}</td>'
-                + td_bar(r["贡献点"], vmax_cont, "{:+.3f}")
-                + td_bar(r["昨日涨跌幅%"], vmax_yd, "{:+.2f}")
-                + td_bar(r["昨日贡献点"], vmax_yc, "{:+.3f}") + "</tr>")
+                + _bar_cell(r["贡献点"], vmax_cont, "{:+.3f}")
+                + _bar_cell(r["昨日涨跌幅%"], vmax_yd, "{:+.2f}")
+                + _bar_cell(r["昨日贡献点"], vmax_yc, "{:+.3f}") + "</tr>")
 
         table_html = f"""<div style="max-height:560px;overflow-y:auto;border:1px solid #E8EAED;border-radius:8px">
         <table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:'Microsoft YaHei',sans-serif">
