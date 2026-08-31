@@ -110,12 +110,30 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     return df
 
 
-def load_fund_flow_cache() -> pd.DataFrame:
-    """读取全部已缓存的资金流向快照（用于聚合/看板）"""
+def load_fund_flow_cache(days: int = 30) -> pd.DataFrame:
+    """读取已缓存的资金流向快照（用于聚合/看板）。
+
+    只加载最近 days 个交易日（默认 30，覆盖看板全部 20 日窗口），并降精度存储
+    （字符串列 category、数值列 float32）——云端 1GB 内存下防止 OOM 白屏。
+    days=0 表示不限制（crowd 清单降级等场景）。
+    """
     files = sorted(FUND_FLOW_DIR.glob("ff_*.parquet"))
+    if days and days > 0:
+        files = files[-days:]          # 文件名 ff_YYYYMMDD 排序即日期序
     if not files:
         return pd.DataFrame()
-    dfs = [pd.read_parquet(f) for f in files]
+    num_cols = ["main_net_amount", "super_net_amount", "big_net_amount",
+                "mid_net_amount", "small_net_amount", "main_net_ratio"]
+    dfs = []
+    for f in files:
+        d = pd.read_parquet(f)
+        for c in num_cols:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce").astype("float32")
+        for c in ("stock_code", "stock_name", "ts_code"):
+            if c in d.columns:
+                d[c] = d[c].astype("category")
+        dfs.append(d)
     df = pd.concat(dfs, ignore_index=True)
     df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
     # aggregator 按 ts_code 过滤成分股（6位代码可直接匹配），补上兼容列

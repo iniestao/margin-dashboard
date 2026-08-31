@@ -76,7 +76,17 @@ def load_margin_history():
     files = sorted(g.glob(str(MARGIN_DIR / "*.parquet")))
     if not files:
         return pd.DataFrame()
-    dfs = [pd.read_parquet(f) for f in files]
+    # 降精度存储防 OOM：数值 float32、字符串 category（云端 1GB 内存）
+    dfs = []
+    for f in files:
+        d = pd.read_parquet(f)
+        for c in ("rzye", "rzmre", "rzche", "rqyl", "rqye"):
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce").astype("float32")
+        for c in ("stock_code", "stock_name"):
+            if c in d.columns:
+                d[c] = d[c].astype("category")
+        dfs.append(d)
     df = pd.concat(dfs, ignore_index=True)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     return df
