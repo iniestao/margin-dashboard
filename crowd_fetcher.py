@@ -263,7 +263,18 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
     # 逐日算占比 + 前5%明细（单日股票数过少的天直接剔除，防残缺数据污染）
     new_rows = []
     detail_rows = []
+    # 名称兜底：实时清单 ∪ 历史清单缓存（清单降级到 fund_flow 并集时名称为空，用历史缓存补）
     name_map = dict(zip(uni["stock_code"].astype(str).str.zfill(6), uni["stock_name"].astype(str)))
+    try:
+        uni_hist = load_stock_universe()
+        if not uni_hist.empty:
+            hist_names = dict(zip(uni_hist["stock_code"].astype(str).str.zfill(6),
+                                  uni_hist["stock_name"].astype(str)))
+            for k, v in hist_names.items():
+                if v and (not name_map.get(k) or name_map.get(k) == "nan"):
+                    name_map[k] = v
+    except Exception:
+        pass
     for d in sorted(day_amounts):
         amts = pd.Series(day_amounts[d])
         row = compute_top5_pct(amts)
