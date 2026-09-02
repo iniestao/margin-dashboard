@@ -203,6 +203,12 @@ def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
     FUND_FLOW_DIR.mkdir(parents=True, exist_ok=True)
     cached = {f.stem.split("_")[1] for f in FUND_FLOW_DIR.glob("ff_*.parquet")}
     missing_dates = sorted(set(dates) - cached)
+    # 排除当日（T 日盘中数据不完整，快照由 fetch_fund_flow_snapshot 在数据完整后单独写入）
+    today_str = datetime.now().strftime("%Y%m%d")
+    skipped_today = [d for d in missing_dates if d >= today_str]
+    if skipped_today:
+        missing_dates = [d for d in missing_dates if d < today_str]
+        print(f">>> 资金流向历史回补：跳过当日/未来日 {skipped_today}（盘中数据不完整）")
     if not missing_dates:
         print(f">>> 资金流向历史缓存完整（{len(cached)} 个交易日），无需回补")
         return {}
