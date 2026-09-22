@@ -20,6 +20,10 @@ import pandas as pd
 from config import FUND_FLOW_DIR
 
 URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
+# 备用域名：主域名返回空响应/非 JSON（云端限流常见）时自动切换
+URL_FALLBACKS = ["https://push2.eastmoney.com/api/qt/clist/get"]
+# 快照整轮拉取上限（秒）：正常约 1-2 分钟，超过即中止——防云端跑批因接口异常无限挂起
+SNAPSHOT_DEADLINE_SEC = 600
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -44,15 +48,30 @@ def _snapshot_date() -> str:
 
 
 def _fetch_page(pn: int, pz: int = 100, proxies: dict | None = None) -> tuple:
-    """拉取一页，返回 (rows, total)"""
+    """拉取一页，返回 (rows, total)。
+
+    云端偶发空响应/非 JSON（限流），逐个域名尝试；全部失败才抛异常（带诊断信息），
+    由上层做有限次退避重试——**绝不在此处无限重试**。
+    """
     params = {
         "pn": str(pn), "pz": str(pz), "po": "1", "np": "1",
         "fltt": "2", "invt": "2", "fid": "f62",
         "fs": FS_ALL, "fields": FIELDS,
     }
-    r = requests.get(URL, params=params, headers=HEADERS, timeout=30, proxies=proxies)
-    data = (r.json().get("data") or {})
-    return (data.get("diff") or []), (data.get("total") or 0)
+    last_err = None
+    for url in [URL] + URL_FALLBACKS:
+        host = url.split("/")[2]
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30, proxies=proxies)
+            if r.status_code != 200:
+                raise ValueError(f"HTTP {r.status_code} @{host}")
+            if not r.text.strip():
+                raise ValueError(f"空响应 @{host}")
+            data = (r.json().get("data") or {})
+            return (data.get("diff") or []), (data.get("total") or 0)
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"全部域名失败: {str(last_err)[:100]}")
 
 
 def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
@@ -65,19 +84,59 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
         return pd.read_parquet(cache)
 
     all_rows, total, pn = [], 0, 1
-    max_pages = 200  # 全市场约 53 页，防死循环
+    max_pages = 200          # 全市场约 53 页，防死循环
+    max_tries = 4            # 每页最多尝试 4 次（含首次），退避 2/4/8 秒
+    deadline = time.time() + SNAPSHOT_DEADLINE_SEC     # 整轮上限，防云端跑批无限挂起（曾挂 3 小时）
+    failed_pages = []
     while pn <= max_pages:
-        try:
-            rows, total = _fetch_page(pn, proxies=proxies)
-        except Exception as e:
-            print(f"  [资金流向] 第 {pn} 页失败: {e}，重试...")
-            time.sleep(2)
-            continue
-        all_rows.extend(rows)
-        if len(all_rows) >= total or not rows:
+        rows, last_err = None, None
+        for attempt in range(1, max_tries + 1):
+            try:
+                rows, total = _fetch_page(pn, proxies=proxies)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < max_tries:
+                    wait = 2 ** attempt
+                    print(f"  [资金流向] 第 {pn} 页失败({attempt}/{max_tries}): {str(e)[:80]}，{wait}s 后重试")
+                    time.sleep(wait)
+        if rows is None:
+            failed_pages.append(pn)
+            print(f"  [资金流向] 第 {pn} 页暂放弃（已试 {max_tries} 次）: {str(last_err)[:80]}")
+            pn += 1
+        else:
+            all_rows.extend(rows)
+            if len(all_rows) >= total or not rows:
+                break
+            pn += 1
+            time.sleep(0.2)
+        if time.time() > deadline:
+            print(f"  [资金流向] 整轮超过 {SNAPSHOT_DEADLINE_SEC//60} 分钟上限，中止（已拉到 {len(all_rows)} 只，失败 {len(failed_pages)} 页）")
             break
-        pn += 1
-        time.sleep(0.2)
+
+    # 二次补拉：接口抖动多为瞬时，对失败页再各试一轮（仍有上限，不会无限挂）
+    if failed_pages and time.time() < deadline:
+        print(f"  [资金流向] 二次补拉 {len(failed_pages)} 个失败页: {failed_pages}")
+        still_failed = []
+        for pn2 in failed_pages:
+            rows2 = None
+            for attempt in range(1, max_tries + 1):
+                try:
+                    rows2, total = _fetch_page(pn2, proxies=proxies)
+                    break
+                except Exception:
+                    if attempt < max_tries:
+                        time.sleep(2 ** attempt)
+            if rows2:
+                all_rows.extend(rows2)
+                print(f"  [资金流向] 第 {pn2} 页补拉成功（+{len(rows2)} 只）")
+            else:
+                still_failed.append(pn2)
+            if time.time() > deadline:
+                print(f"  [资金流向] 补拉超时中止，剩余未补: {still_failed + failed_pages[failed_pages.index(pn2)+1:]}")
+                break
+        failed_pages = still_failed
 
     if not all_rows:
         print(f">>> 资金流向 {date_str}: 无数据")
@@ -101,9 +160,12 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     for col in ["main_net_amount", "super_net_amount", "big_net_amount",
                 "mid_net_amount", "small_net_amount", "main_net_ratio"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    # 不完整（远少于 total）不缓存，避免污染后续聚合
+    # 不完整（远少于 total）或有整页失败时不缓存，避免污染后续聚合
     if total and len(df) < total * 0.9:
         print(f"⚠️ 资金流向 {date_str} 数据不完整（{len(df)}/{total}），本次不缓存")
+        return df
+    if failed_pages:
+        print(f"⚠️ 资金流向 {date_str}: {len(failed_pages)} 页补拉后仍失败 {failed_pages}（{len(df)}/{total}），本次不缓存，下次跑批自动重试")
         return df
     df.to_parquet(cache, index=False)
     print(f">>> 资金流向 {date_str}: {len(df)} 只 (total={total})")

@@ -11,6 +11,7 @@ on:
 jobs:
   update-data:
     runs-on: ubuntu-latest
+    timeout-minutes: 90          # 兜底：正常 25-40 分钟，超时强制结束，防跑批无限挂起（曾挂 3 小时）
     permissions:
       contents: write
     steps:
