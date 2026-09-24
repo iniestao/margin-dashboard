@@ -27,6 +27,39 @@ SNAPSHOT_DEADLINE_SEC = 600
 # 全市场完整快照下限：正常 ~5200 只；低于此值说明接口返回残缺数据（total 也会被一起骗小，
 # 光靠 len(df) >= total 拦不住），必须拒绝缓存，否则残缺数据会永久留在缓存里（快照"已缓存即跳过"）
 MIN_FULL_UNIVERSE = 3000
+
+
+def _full_universe_threshold() -> int:
+    """"完整快照"下限：优先按当前全市场清单规模的 90%，清单不可用时退回绝对下限。
+
+    背景（2026-09-24 事故）：绝对值 3000 会把 3122 行的半残快照（历史回补只成功 60%）
+    误判为"完整"，导致既不复检也不重拉，残缺永久留存。改成相对阈值后，
+    低于 90% 全市场规模的快照会被识别为残缺并强制重拉。
+    """
+    try:
+        from config import STOCK_UNIVERSE_CSV
+        if STOCK_UNIVERSE_CSV.exists():
+            n = len(pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str}))
+            if n >= MIN_FULL_UNIVERSE:
+                return int(n * 0.9)
+    except Exception:
+        pass
+    return MIN_FULL_UNIVERSE
+
+
+def _is_trading_hours() -> bool:
+    """是否处于 A 股盘中（北京 09:15~15:05，工作日）。
+
+    盘中运行时 clist 返回的是"当日盘中"资金流，而 _snapshot_date() 返回的是
+    "上一交易日"，直接落盘会造成日期错配（2026-09-24 实测：ff_20260921.parquet
+    里装的是 9/22 的盘中数据，成因是 9/22 上午 10:05 的一次手动跑批）。
+    """
+    from datetime import timezone, timedelta
+    bj = datetime.now(timezone(timedelta(hours=8)))
+    if bj.weekday() >= 5:
+        return False
+    return (9, 15) <= (bj.hour, bj.minute) <= (15, 5)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -82,13 +115,17 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     FUND_FLOW_DIR.mkdir(parents=True, exist_ok=True)
     date_str = _snapshot_date()
     cache = FUND_FLOW_DIR / f"ff_{date_str}.parquet"
+    thresh = _full_universe_threshold()
+    # 在"发起请求时"就固定盘中标记：若 14:50 起跑、15:10 才写盘，
+    # 用写盘时刻判断会漏掉（拿到的其实是当日盘中数据）
+    intraday = _is_trading_hours()
     if cache.exists():
         cached = pd.read_parquet(cache)
-        if len(cached) >= MIN_FULL_UNIVERSE:
+        if len(cached) >= thresh:
             print(f">>> 资金流向 {date_str} 已缓存 ({len(cached)} 只)")
             return cached
         # 残缺缓存（历史回补只写成分股子集）→ 不当作已缓存，强制重拉全市场
-        print(f"⚠️ 资金流向 {date_str} 缓存残缺（{len(cached)} 只 < {MIN_FULL_UNIVERSE}），强制重拉全市场")
+        print(f"⚠️ 资金流向 {date_str} 缓存残缺（{len(cached)} 只 < 完整下限 {thresh}），强制重拉全市场")
 
     all_rows, total, pn = [], 0, 1
     max_pages = 200          # 全市场约 53 页，防死循环
@@ -176,8 +213,12 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
         return df
     # 残缺保护：接口异常时 total 会一起被报小（实测曾返回 84/107 只且 total 同值），
     # 上面的比率校验拦不住，必须按全市场绝对下限再兜一层
-    if len(df) < MIN_FULL_UNIVERSE:
-        print(f"⚠️ 资金流向 {date_str} 仅 {len(df)} 只（低于全市场下限 {MIN_FULL_UNIVERSE}，total={total} 不可信），本次不缓存，下次跑批自动重试")
+    if len(df) < thresh:
+        print(f"⚠️ 资金流向 {date_str} 仅 {len(df)} 只（低于完整下限 {thresh}，total={total} 不可信），本次不缓存，下次跑批自动重试")
+        return df
+    # 盘中守卫：盘中 clist 返回当日盘中数据，而快照日期是上一交易日 → 写入会造成日期错配
+    if intraday or _is_trading_hours():
+        print(f"⚠️ 本次拉取处于 A 股盘中（北京 09:15~15:05），数据为当日盘中而非 {date_str}，拒绝写入以防日期错配")
         return df
     df.to_parquet(cache, index=False)
     print(f">>> 资金流向 {date_str}: {len(df)} 只 (total={total})")
@@ -228,17 +269,32 @@ def load_name_map() -> dict:
     """从全市场清单缓存读 6 位代码 -> 名称 映射（历史回补补名称用）。
 
     历史回补接口只返回净额，不带名称；若留空，明细/看板会显示"只有代码没有名称"。
+    清单缓存的 stock_name 可能整列为空（2026-09-24 事故：无名称清单覆盖了原缓存），
+    此时退回用最近一个健康快照 ff_*.parquet 的名称，避免回补文件再变"只有代码"。
     """
     from config import STOCK_UNIVERSE_CSV
+    _csv_map = {}
     try:
-        if not STOCK_UNIVERSE_CSV.exists():
-            return {}
-        u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
-        c6 = u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
-        return {k: v for k, v in zip(c6, u["stock_name"].astype(str)) if v and v != "nan"}
+        if STOCK_UNIVERSE_CSV.exists():
+            u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+            c6 = u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
+            _csv_map = {k: v for k, v in zip(c6, u["stock_name"].astype(str)) if v and v != "nan"}
     except Exception as e:
-        print(f"  [资金流向] 清单名称映射读取失败（{str(e)[:60]}），回补文件名称将为空")
-        return {}
+        print(f"  [资金流向] 清单名称映射读取失败（{str(e)[:60]}）")
+    if len(_csv_map) >= 1000:
+        return _csv_map
+    print(f"  [资金流向] ⚠️ 清单名称映射仅 {len(_csv_map)} 条可用，退回用最近健康快照的名称")
+    for f in sorted(FUND_FLOW_DIR.glob("ff_*.parquet"), reverse=True):
+        try:
+            d = pd.read_parquet(f, columns=["stock_code", "stock_name"])
+            nm = {k: v for k, v in zip(d["stock_code"].astype(str).str.zfill(6),
+                                      d["stock_name"].astype(str)) if v and v != "nan"}
+            if len(nm) >= 1000:
+                print(f"  [资金流向] 用 {f.name} 提供 {len(nm)} 条名称映射")
+                return nm
+        except Exception:
+            continue
+    return _csv_map
 
 
 def _market_id(stock_code: str) -> int:
@@ -370,7 +426,7 @@ def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
         # 绝不覆盖已有的完整快照：回补只有成分股子集，覆盖会让全市场数据退化成子集
         if out.exists():
             try:
-                if len(pd.read_parquet(out)) >= MIN_FULL_UNIVERSE:
+                if len(pd.read_parquet(out)) >= _full_universe_threshold():
                     skipped_full.append(d)
                     continue
             except Exception:

@@ -63,7 +63,7 @@ def main():
     fetch_fund_flow_snapshot()
 
     # 1.8 资金流向历史回补 + 残缺自愈（全市场口径，与 cloud_update.py 一致）
-    from fund_flow_fetcher import MIN_FULL_UNIVERSE
+    from fund_flow_fetcher import MIN_FULL_UNIVERSE, _full_universe_threshold
     from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
     uni_codes = []
     try:
@@ -73,18 +73,21 @@ def main():
     except Exception as _e:
         print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
     if uni_codes:
+        # 残缺检测：近 40 个交易日中，行数明显低于全市场规模的快照 → 强制重拉修复
+        #  阈值取 max(3000, 清单规模×90%)，理由同 cloud_update.py（防半残快照误判为健康）
+        _thresh = _full_universe_threshold()
         broken = []
-        for _d in sorted(all_dates)[-20:]:
+        for _d in sorted(all_dates)[-40:]:
             _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
             if not _f.exists():
                 continue
             try:
-                if len(pd.read_parquet(_f)) < MIN_FULL_UNIVERSE:
+                if len(pd.read_parquet(_f)) < _thresh:
                     broken.append(_d)
             except Exception:
                 broken.append(_d)
         if broken:
-            print(f">>> 检测到残缺资金流快照 {broken}，用全市场清单强制重拉")
+            print(f">>> 检测到残缺资金流快照 {broken}（完整下限 {_thresh} 只），用全市场清单强制重拉")
         fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）

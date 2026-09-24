@@ -139,6 +139,18 @@ def fetch_stock_universe(proxies: dict | None = None) -> pd.DataFrame:
     df = pd.DataFrame({"stock_code": sorted(codes), "stock_name": "", "amount": float("nan")})
     if len(df) < 3000:
         raise RuntimeError(f"全市场清单严重残缺（仅 {len(df)} 只），拒绝返回以防占比失真")
+    # 名称兜底：本分支不含名称，用已有清单缓存补；否则会把名称写空、并覆盖掉原缓存
+    # （2026-09-24 事故：云端 stock_universe.csv 5226 行 stock_name 因此 100% 变空）
+    try:
+        _hist = load_stock_universe()
+        if not _hist.empty and "stock_name" in _hist.columns:
+            _nm = dict(zip(_hist["stock_code"].astype(str).str.zfill(6),
+                           _hist["stock_name"].astype(str)))
+            df["stock_name"] = df["stock_code"].map(_nm).fillna("")
+            _n = int(df["stock_name"].astype(str).str.strip().ne("").sum())
+            print(f"  [清单] 降级为 fund_flow 并集，已用历史清单缓存补名称 {_n}/{len(df)}")
+    except Exception as e:
+        print(f"  [清单] 并集降级补名称失败（{str(e)[:60]}）")
     return df
 
 
@@ -246,7 +258,22 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
         # 仅实时清单成功时才写清单缓存
         uni_out = uni[["stock_code", "stock_name"]].copy()
         uni_out["as_of_date"] = datetime.now().strftime("%Y-%m-%d")
-        uni_out.to_csv(STOCK_UNIVERSE_CSV, index=False)
+        # 写入守卫：名称填充率过低时先尝试用旧缓存补，仍低则拒绝覆盖
+        # （2026-09-24 事故：无名称清单把 5226 行完整名称缓存覆盖成全空，
+        #   连带 top5 明细与资金流回补全部"只有代码没有名称"）
+        _rate = uni_out["stock_name"].astype(str).str.strip().replace("nan", "").ne("").mean()
+        if _rate < 0.5:
+            _hist = load_stock_universe()
+            if not _hist.empty and "stock_name" in _hist.columns:
+                _nm = dict(zip(_hist["stock_code"].astype(str).str.zfill(6),
+                               _hist["stock_name"].astype(str)))
+                uni_out["stock_name"] = uni_out["stock_code"].map(_nm).fillna(uni_out["stock_name"])
+            _rate = uni_out["stock_name"].astype(str).str.strip().replace("nan", "").ne("").mean()
+        if _rate < 0.5:
+            print(f"  [清单] ⚠️ 名称填充率仅 {_rate:.0%}，拒绝覆盖清单缓存（保留原文件）")
+        else:
+            uni_out.to_csv(STOCK_UNIVERSE_CSV, index=False)
+            print(f"  [清单] 已写清单缓存 {len(uni_out)} 只（名称填充率 {_rate:.0%}）")
     codes = uni["stock_code"].astype(str).tolist()
 
     print(f">>> 拥挤度回补：{len(missing)} 日缺失，{len(codes)} 只股票，并发 {workers}（约 20-40 分钟）")
