@@ -34,11 +34,17 @@ jobs:
           git reset --hard origin/main
 
       - name: 更新数据（增量追加）
-        run: python cloud_update.py
+        # -u：stdout 不缓冲。原来输出被块缓冲、全部在最后一刻刷出，
+        # 日志里所有行时间戳相同，无法判断哪一步耗时/何时开始失败（2026-09-24 排查受阻）
+        run: python -u cloud_update.py
         env:
           LOOKBACK_DAYS: "100"
+          PYTHONUNBUFFERED: "1"
 
       - name: 提交数据回仓库
+        # always()：上面的更新步骤在"数据仍残缺"时会以退出码 1 结束（故意让跑批变红），
+        # 此时仍要把已拉到的数据提交上去，否则半残状态会被整体丢弃
+        if: always()
         run: |
           git add data
           git diff --quiet && git diff --cached --quiet || git commit -m "chore(data): 每日融资数据更新 $(date -u +%Y-%m-%d)"

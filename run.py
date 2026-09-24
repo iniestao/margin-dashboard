@@ -72,12 +72,13 @@ def main():
         print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
     except Exception as _e:
         print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+    ff_deficit = {}
     if uni_codes:
-        # 残缺检测：近 40 个交易日中，行数明显低于全市场规模的快照 → 强制重拉修复
-        #  阈值取 max(3000, 清单规模×90%)，理由同 cloud_update.py（防半残快照误判为健康）
+        # 残缺检测：扫描全部回溯窗口内的交易日（窗口从 40 日放开——每只股票一次请求返回全历史，
+        # 缺 1 天与缺 90 天的请求量相同），阈值 max(3000, 清单×90%)
         _thresh = _full_universe_threshold()
         broken = []
-        for _d in sorted(all_dates)[-40:]:
+        for _d in sorted(all_dates):
             _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
             if not _f.exists():
                 continue
@@ -87,8 +88,10 @@ def main():
             except Exception:
                 broken.append(_d)
         if broken:
-            print(f">>> 检测到残缺资金流快照 {broken}（完整下限 {_thresh} 只），用全市场清单强制重拉")
-        fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+            print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
+                  f"用全市场清单强制重拉")
+        _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+        ff_deficit = (_ff_res or {}).get("deficit") or {}
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history
@@ -117,6 +120,12 @@ def main():
         rz = latest.get("total_rz_balance", 0)
         dt = latest.get("trade_date", "-")
         print(f"  {name}: 融资余额 {rz/1e8:,.1f}亿 ({dt})")
+
+    # 数据完整性收口提示（本地模式下只警告，不阻塞启动看板）
+    if ff_deficit:
+        print(f"\n❌ 资金流回补后仍有 {len(ff_deficit)} 天残缺（完整下限 {_full_universe_threshold()} 只）:")
+        for _d, _n in sorted(ff_deficit.items()):
+            print(f"     {_d}: {_n} 只")
 
     # 3. 启动看板
     print("\n>>> 启动看板...")

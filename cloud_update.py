@@ -89,13 +89,16 @@ def main():
         print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
     except Exception as _e:
         print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+    ff_deficit = {}
     if uni_codes:
-        # 残缺检测：近 40 个交易日中，行数明显低于全市场规模的快照 → 强制重拉修复
+        # 残缺检测：扫描全部回溯窗口内的交易日，行数明显低于全市场规模的快照 → 强制重拉修复
         #  阈值取 max(3000, 清单规模×90%)：绝对值 3000 曾把 3122 行的"半残快照"
-        #  （历史回补只成功约 60%）误判为健康，导致残缺永久留存；窗口 20 日曾漏掉 8/27
+        #  （历史回补只成功约 60%）误判为健康，导致残缺永久留存；窗口 20 日曾漏掉 8/27。
+        #  注意：窗口从 40 日放开到全部——每只股票一次请求就返回全历史，
+        #  缺 1 天和缺 90 天的请求量相同，不存在"窗口大就跑得久"的问题。
         _thresh = _full_universe_threshold()
         broken = []
-        for _d in sorted(all_dates)[-40:]:
+        for _d in sorted(all_dates):
             _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
             if not _f.exists():
                 continue
@@ -105,8 +108,10 @@ def main():
             except Exception:
                 broken.append(_d)
         if broken:
-            print(f">>> 检测到残缺资金流快照 {broken}（完整下限 {_thresh} 只），用全市场清单强制重拉")
-        fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+            print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
+                  f"用全市场清单强制重拉")
+        _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+        ff_deficit = (_ff_res or {}).get("deficit") or {}
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history
@@ -137,6 +142,17 @@ def main():
         print(f"  {name}: 融资余额 {rz/1e8:,.1f}亿 ({dt})")
 
     print("\n>>> 云上数据更新完成")
+
+    # 数据完整性收口：回补后仍有残缺日 → 让这一步以非 0 退出，跑批变红而不是"绿着失败"
+    # （2026-09-24 事故：回补失败 2994/5226、写出 2226 行的半残文件，run 仍显示 success）
+    if ff_deficit:
+        print(f"\n❌ 资金流回补后仍有 {len(ff_deficit)} 天残缺（完整下限 {_full_universe_threshold()} 只）:")
+        for _d, _n in sorted(ff_deficit.items()):
+            print(f"     {_d}: {_n} 只")
+        print("   原因通常是云端 runner（Azure 境外机房）访问东财不稳定，"
+              "或本地出口被东财限流；数据已尽可能写入，残缺日会在下次跑批继续重试。")
+        print("   >>> 本次跑批判定为「数据不完整」，退出码 1，请在 Actions 里核对。")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
