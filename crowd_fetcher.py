@@ -213,8 +213,10 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
     返回 {"backfilled_dates": int, "total_dates": int, "failed_stocks": int, "total_stocks": int}
     """
     from config import CROWD_DIR, AMOUNT_CONC_CSV, STOCK_UNIVERSE_CSV
+    from realtime_fetcher import get_proxies
     CROWD_DIR.mkdir(parents=True, exist_ok=True)
     workers = workers or CROWD_WORKERS
+    proxies = proxies or get_proxies()   # 关键：None 时解析 RT_PROXY，避免走失效的系统默认路径
 
     target_dates = _trading_dates(days)
     existing = set()
@@ -226,13 +228,26 @@ def backfill_amount_conc(days: int = 120, workers: int | None = None,
         return {"backfilled_dates": 0, "total_dates": len(target_dates),
                 "failed_stocks": 0, "total_stocks": 0}
 
-    # 全市场清单
-    uni = fetch_stock_universe(proxies=proxies)
+    # 全市场清单：实时获取失败/残缺时降级用历史清单缓存（本地完整快照，占比计算不受影响）
+    uni = None
+    try:
+        uni = fetch_stock_universe(proxies=proxies)
+    except Exception as e:
+        print(f"  [清单] 实时清单失败（{str(e)[:60]}），降级历史清单缓存")
+    if uni is None or len(uni) < 3000:
+        uni_hist = load_stock_universe()
+        if uni_hist.empty:
+            raise RuntimeError("实时清单与历史清单缓存均不可用，无法回补")
+        uni = uni_hist
+        print(f"  [清单] 使用历史清单缓存：{len(uni)} 只（缓存日 {uni['as_of_date'].max() if 'as_of_date' in uni.columns else '-'}）")
+        if not AMOUNT_CONC_CSV.exists() or not existing:
+            pass  # 历史清单不回写缓存，避免覆盖
+    else:
+        # 仅实时清单成功时才写清单缓存
+        uni_out = uni[["stock_code", "stock_name"]].copy()
+        uni_out["as_of_date"] = datetime.now().strftime("%Y-%m-%d")
+        uni_out.to_csv(STOCK_UNIVERSE_CSV, index=False)
     codes = uni["stock_code"].astype(str).tolist()
-    # 写清单缓存
-    uni_out = uni[["stock_code", "stock_name"]].copy()
-    uni_out["as_of_date"] = datetime.now().strftime("%Y-%m-%d")
-    uni_out.to_csv(STOCK_UNIVERSE_CSV, index=False)
 
     print(f">>> 拥挤度回补：{len(missing)} 日缺失，{len(codes)} 只股票，并发 {workers}（约 20-40 分钟）")
     t0 = time.time()

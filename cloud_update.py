@@ -77,15 +77,33 @@ def main():
     from fund_flow_fetcher import fetch_fund_flow_snapshot, fetch_fund_flow_history
     fetch_fund_flow_snapshot()
 
-    # 1.8 资金流向历史回补（首次补齐过去交易日，与其他数据一致）
-    from index_loader import get_all_available_indices, load_index_weights
-    hist_codes = set()
-    for _ic in get_all_available_indices():
-        _w = load_index_weights(_ic)
-        if not _w.empty:
-            hist_codes.update(_w["stock_code"].astype(str).str.split(".").str[0])
-    if hist_codes:
-        fetch_fund_flow_history(sorted(hist_codes), sorted(all_dates))
+    # 1.8 资金流向历史回补 + 残缺自愈（全市场口径）
+    #   原实现只回补指数成分股且不带名称——导致"残缺快照"（84~173 行）一旦落盘就永久留存
+    #   （快照函数"已缓存即跳过"），看板资金流 Tab 出现大片 NaN、明细只有代码没有名称。
+    from fund_flow_fetcher import MIN_FULL_UNIVERSE
+    from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
+    uni_codes = []
+    try:
+        _u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+        uni_codes = sorted(set(_u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)))
+        print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
+    except Exception as _e:
+        print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+    if uni_codes:
+        # 残缺检测：近 20 个交易日中，行数远低于全市场的快照 → 强制重拉修复
+        broken = []
+        for _d in sorted(all_dates)[-20:]:
+            _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
+            if not _f.exists():
+                continue
+            try:
+                if len(pd.read_parquet(_f)) < MIN_FULL_UNIVERSE:
+                    broken.append(_d)
+            except Exception:
+                broken.append(_d)
+        if broken:
+            print(f">>> 检测到残缺资金流快照 {broken}，用全市场清单强制重拉")
+        fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history

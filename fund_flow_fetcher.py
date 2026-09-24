@@ -24,6 +24,9 @@ URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 URL_FALLBACKS = ["https://push2.eastmoney.com/api/qt/clist/get"]
 # 快照整轮拉取上限（秒）：正常约 1-2 分钟，超过即中止——防云端跑批因接口异常无限挂起
 SNAPSHOT_DEADLINE_SEC = 600
+# 全市场完整快照下限：正常 ~5200 只；低于此值说明接口返回残缺数据（total 也会被一起骗小，
+# 光靠 len(df) >= total 拦不住），必须拒绝缓存，否则残缺数据会永久留在缓存里（快照"已缓存即跳过"）
+MIN_FULL_UNIVERSE = 3000
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -80,8 +83,12 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     date_str = _snapshot_date()
     cache = FUND_FLOW_DIR / f"ff_{date_str}.parquet"
     if cache.exists():
-        print(f">>> 资金流向 {date_str} 已缓存 ({len(pd.read_parquet(cache))} 只)")
-        return pd.read_parquet(cache)
+        cached = pd.read_parquet(cache)
+        if len(cached) >= MIN_FULL_UNIVERSE:
+            print(f">>> 资金流向 {date_str} 已缓存 ({len(cached)} 只)")
+            return cached
+        # 残缺缓存（历史回补只写成分股子集）→ 不当作已缓存，强制重拉全市场
+        print(f"⚠️ 资金流向 {date_str} 缓存残缺（{len(cached)} 只 < {MIN_FULL_UNIVERSE}），强制重拉全市场")
 
     all_rows, total, pn = [], 0, 1
     max_pages = 200          # 全市场约 53 页，防死循环
@@ -167,6 +174,11 @@ def fetch_fund_flow_snapshot(proxies: dict | None = None) -> pd.DataFrame:
     if failed_pages:
         print(f"⚠️ 资金流向 {date_str}: {len(failed_pages)} 页补拉后仍失败 {failed_pages}（{len(df)}/{total}），本次不缓存，下次跑批自动重试")
         return df
+    # 残缺保护：接口异常时 total 会一起被报小（实测曾返回 84/107 只且 total 同值），
+    # 上面的比率校验拦不住，必须按全市场绝对下限再兜一层
+    if len(df) < MIN_FULL_UNIVERSE:
+        print(f"⚠️ 资金流向 {date_str} 仅 {len(df)} 只（低于全市场下限 {MIN_FULL_UNIVERSE}，total={total} 不可信），本次不缓存，下次跑批自动重试")
+        return df
     df.to_parquet(cache, index=False)
     print(f">>> 资金流向 {date_str}: {len(df)} 只 (total={total})")
     return df
@@ -212,6 +224,23 @@ def load_fund_flow_cache(days: int = 30) -> pd.DataFrame:
 _HIST_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 
 
+def load_name_map() -> dict:
+    """从全市场清单缓存读 6 位代码 -> 名称 映射（历史回补补名称用）。
+
+    历史回补接口只返回净额，不带名称；若留空，明细/看板会显示"只有代码没有名称"。
+    """
+    from config import STOCK_UNIVERSE_CSV
+    try:
+        if not STOCK_UNIVERSE_CSV.exists():
+            return {}
+        u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+        c6 = u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)
+        return {k: v for k, v in zip(c6, u["stock_name"].astype(str)) if v and v != "nan"}
+    except Exception as e:
+        print(f"  [资金流向] 清单名称映射读取失败（{str(e)[:60]}），回补文件名称将为空")
+        return {}
+
+
 def _market_id(stock_code: str) -> int:
     """6/9 开头=沪市(1)，其余=深市(0)"""
     return 1 if str(stock_code).startswith(("6", "9")) else 0
@@ -255,16 +284,27 @@ def _fetch_stock_flow_history(stock_code: str, proxies: dict | None = None) -> p
 
 def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
                             proxies: dict | None = None,
-                            workers: int = 8, max_codes: int | None = None) -> dict:
+                            workers: int = 8, max_codes: int | None = None,
+                            overwrite_dates: list[str] | None = None,
+                            tries: int = 3) -> dict:
     """对成分股逐只回补历史资金流，写入缺失日期的 ff_YYYYMMDD.parquet
 
     首次运行把过去 N 个交易日补齐（与其他数据一致）；已有快照的日期跳过。
+    overwrite_dates: 即使已缓存也重拉（用于修复残缺缓存，如历史回补只写了成分股子集的日子）。
+    tries: 单只股票的最大尝试次数——东财 push2his 走代理失败率较高（实测约 70%），
+           必须重试，否则回补只能成功百来只（这正是 9/22、9/23 快照残缺的成因）。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     FUND_FLOW_DIR.mkdir(parents=True, exist_ok=True)
     cached = {f.stem.split("_")[1] for f in FUND_FLOW_DIR.glob("ff_*.parquet")}
     missing_dates = sorted(set(dates) - cached)
+    # 强制重拉的日期（修复残缺缓存）
+    if overwrite_dates:
+        forced = sorted(set(dates) & set(overwrite_dates))
+        if forced:
+            print(f">>> 资金流向：强制重拉指定日期 {forced}")
+            missing_dates = sorted(set(missing_dates) | set(forced))
     # 排除当日（T 日盘中数据不完整，快照由 fetch_fund_flow_snapshot 在数据完整后单独写入）
     today_str = datetime.now().strftime("%Y%m%d")
     skipped_today = [d for d in missing_dates if d >= today_str]
@@ -282,12 +322,21 @@ def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
     # 并行拉取每只股票的历史
     daily_rows = {d: [] for d in missing_dates}
     done = 0
+    failed = 0
 
     def _worker(code):
-        try:
-            return code, _fetch_stock_flow_history(code, proxies)
-        except Exception as e:
-            return code, None
+        last_err = None
+        for attempt in range(1, tries + 1):
+            try:
+                d = _fetch_stock_flow_history(code, proxies)
+                if d is not None and not d.empty:
+                    return code, d
+                last_err = "返回空"
+            except Exception as e:
+                last_err = e
+            if attempt < tries:
+                time.sleep(0.5 * attempt)
+        return code, None
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(_worker, c) for c in stock_codes]
@@ -295,8 +344,9 @@ def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
             code, hist = fut.result()
             done += 1
             if done % 200 == 0:
-                print(f"    回补进度: {done}/{len(stock_codes)}")
+                print(f"    回补进度: {done}/{len(stock_codes)}（失败 {failed}）")
             if hist is None or hist.empty:
+                failed += 1
                 continue
             for _, r in hist.iterrows():
                 d = str(r["trade_date"])
@@ -311,17 +361,31 @@ def fetch_fund_flow_history(stock_codes: list[str], dates: list[str],
                     })
 
     written = 0
+    name_map = load_name_map()
+    skipped_full = []
     for d, rows in daily_rows.items():
         if not rows:
             continue
+        out = FUND_FLOW_DIR / f"ff_{d}.parquet"
+        # 绝不覆盖已有的完整快照：回补只有成分股子集，覆盖会让全市场数据退化成子集
+        if out.exists():
+            try:
+                if len(pd.read_parquet(out)) >= MIN_FULL_UNIVERSE:
+                    skipped_full.append(d)
+                    continue
+            except Exception:
+                pass
         df = pd.DataFrame(rows)
         df.insert(0, "trade_date", d)
-        df["stock_name"] = ""
+        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["stock_name"] = df["stock_code"].map(name_map).fillna("")   # 补名称，避免"只有代码没名称"
         df["main_net_ratio"] = None
-        df.to_parquet(FUND_FLOW_DIR / f"ff_{d}.parquet", index=False)
+        df.to_parquet(out, index=False)
         written += 1
-    print(f">>> 资金流向历史回补完成：写入 {written} 个交易日（每日期含 {len(stock_codes)} 只成分股）")
-    return {"written": written, "dates": missing_dates}
+    if skipped_full:
+        print(f">>> 已有完整快照、跳过覆盖的日期: {skipped_full}")
+    print(f">>> 资金流向历史回补完成：写入 {written} 个交易日（失败 {failed} 只 / 共 {len(stock_codes)} 只）")
+    return {"written": written, "dates": missing_dates, "failed": failed}
 
 
 if __name__ == "__main__":
