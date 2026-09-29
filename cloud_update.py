@@ -74,44 +74,47 @@ def main():
     fetch_etf_nav(list(NATIONAL_TEAM_ETF.keys()))
 
     # 1.7 拉取全市场资金流向快照（东财）
+    #   每日跑批只做「当日/T-1 增量」：拉当日快照，失败仅告警、不触发全历史回补、不 exit(1)。
+    #   历史残缺（如 5/08~8/07 那段）由 BACKFILL_HISTORY=1 在本机单独补，见 1.8。
     from fund_flow_fetcher import fetch_fund_flow_snapshot, fetch_fund_flow_history
-    fetch_fund_flow_snapshot()
+    _snap_df = fetch_fund_flow_snapshot()
+    if _snap_df.empty:
+        print("⚠️ 资金流向当日快照为空（东财 push2 走 runner 常成片 502），本次跳过，下次跑批重试")
 
-    # 1.8 资金流向历史回补 + 残缺自愈（全市场口径）
-    #   原实现只回补指数成分股且不带名称——导致"残缺快照"（84~173 行）一旦落盘就永久留存
-    #   （快照函数"已缓存即跳过"），看板资金流 Tab 出现大片 NaN、明细只有代码没有名称。
-    from fund_flow_fetcher import MIN_FULL_UNIVERSE, _full_universe_threshold
-    from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
-    uni_codes = []
-    try:
-        _u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
-        uni_codes = sorted(set(_u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)))
-        print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
-    except Exception as _e:
-        print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+    # 1.8 资金流向历史回补（本机补历史专用，云端每日跑批默认关闭）
+    #   背景：为修 9/24 那批历史残缺加的「全历史残缺检测 + 全市场回补」，把每日跑批也拖进了
+    #   一个跑不完的回补黑洞——65 个历史日（含 3/16~4/01 接口窗口已过、永远补不齐的那段），
+    #   5226 只 × 65 天逐只回补 ≈ 2 小时+，每次都被 90min timeout 取消（"绿着失败"）。
+    #   解法：历史回补与每日增量解耦。只有显式设置 BACKFILL_HISTORY=1（本机执行）时才跑，
+    #   云端每日跑批不再碰它，只补当日/T-1。
     ff_deficit = {}
-    if uni_codes:
-        # 残缺检测：扫描全部回溯窗口内的交易日，行数明显低于全市场规模的快照 → 强制重拉修复
-        #  阈值取 max(3000, 清单规模×90%)：绝对值 3000 曾把 3122 行的"半残快照"
-        #  （历史回补只成功约 60%）误判为健康，导致残缺永久留存；窗口 20 日曾漏掉 8/27。
-        #  注意：窗口从 40 日放开到全部——每只股票一次请求就返回全历史，
-        #  缺 1 天和缺 90 天的请求量相同，不存在"窗口大就跑得久"的问题。
-        _thresh = _full_universe_threshold()
-        broken = []
-        for _d in sorted(all_dates):
-            _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
-            if not _f.exists():
-                continue
-            try:
-                if len(pd.read_parquet(_f)) < _thresh:
+    if os.environ.get("BACKFILL_HISTORY") == "1":
+        from fund_flow_fetcher import _full_universe_threshold
+        from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
+        uni_codes = []
+        try:
+            _u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+            uni_codes = sorted(set(_u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)))
+            print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
+        except Exception as _e:
+            print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+        if uni_codes:
+            _thresh = _full_universe_threshold()
+            broken = []
+            for _d in sorted(all_dates):
+                _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
+                if not _f.exists():
+                    continue
+                try:
+                    if len(pd.read_parquet(_f)) < _thresh:
+                        broken.append(_d)
+                except Exception:
                     broken.append(_d)
-            except Exception:
-                broken.append(_d)
-        if broken:
-            print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
-                  f"用全市场清单强制重拉")
-        _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
-        ff_deficit = (_ff_res or {}).get("deficit") or {}
+            if broken:
+                print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
+                      f"用全市场清单强制重拉")
+            _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+            ff_deficit = (_ff_res or {}).get("deficit") or {}
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history
@@ -143,16 +146,18 @@ def main():
 
     print("\n>>> 云上数据更新完成")
 
-    # 数据完整性收口：回补后仍有残缺日 → 让这一步以非 0 退出，跑批变红而不是"绿着失败"
-    # （2026-09-24 事故：回补失败 2994/5226、写出 2226 行的半残文件，run 仍显示 success）
+    # 数据完整性收口：仅在「本机补历史模式」（BACKFILL_HISTORY=1）下，回补后仍有残缺日才 exit(1)。
+    # 云端每日跑批（默认）不再因历史残缺而变红——当日快照失败已在 1.7 告警并跳过，
+    # 增量跑批的职责是「尽可能拉到当日数据」，不承担「补齐 65 天历史」这个不可能在 90min 内完成的任务。
     if ff_deficit:
-        print(f"\n❌ 资金流回补后仍有 {len(ff_deficit)} 天残缺（完整下限 {_full_universe_threshold()} 只）:")
+        print(f"\n⚠️ 资金流历史回补后仍有 {len(ff_deficit)} 天残缺（完整下限 {_full_universe_threshold()} 只）:")
         for _d, _n in sorted(ff_deficit.items()):
             print(f"     {_d}: {_n} 只")
-        print("   原因通常是云端 runner（Azure 境外机房）访问东财不稳定，"
-              "或本地出口被东财限流；数据已尽可能写入，残缺日会在下次跑批继续重试。")
-        print("   >>> 本次跑批判定为「数据不完整」，退出码 1，请在 Actions 里核对。")
-        sys.exit(1)
+        print("   原因通常是访问东财不稳定（云端 runner 在境外，实测失败率可达 57%）；"
+              "残缺日请在本机用 BACKFILL_HISTORY=1 分块温和回补。")
+        if os.environ.get("BACKFILL_HISTORY") == "1":
+            print("   >>> 本机补历史模式下判定为「数据不完整」，退出码 1。")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

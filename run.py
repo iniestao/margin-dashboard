@@ -1,5 +1,6 @@
 """A股资金变化看板 - 一键入口"""
 
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -62,36 +63,38 @@ def main():
     from fund_flow_fetcher import fetch_fund_flow_snapshot, fetch_fund_flow_history
     fetch_fund_flow_snapshot()
 
-    # 1.8 资金流向历史回补 + 残缺自愈（全市场口径，与 cloud_update.py 一致）
-    from fund_flow_fetcher import MIN_FULL_UNIVERSE, _full_universe_threshold
-    from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
-    uni_codes = []
-    try:
-        _u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
-        uni_codes = sorted(set(_u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)))
-        print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
-    except Exception as _e:
-        print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+    # 1.8 资金流向历史回补（本机补历史专用，默认关闭）
+    #   与 cloud_update.py 一致：历史回补与每日增量解耦。启动看板时不再自动触发全历史回补，
+    #   否则 65 个历史残缺日 × 5226 只逐只回补会卡住启动几分钟到几十分钟。
+    #   需要补历史时：BACKFILL_HISTORY=1 python run.py
     ff_deficit = {}
-    if uni_codes:
-        # 残缺检测：扫描全部回溯窗口内的交易日（窗口从 40 日放开——每只股票一次请求返回全历史，
-        # 缺 1 天与缺 90 天的请求量相同），阈值 max(3000, 清单×90%)
-        _thresh = _full_universe_threshold()
-        broken = []
-        for _d in sorted(all_dates):
-            _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
-            if not _f.exists():
-                continue
-            try:
-                if len(pd.read_parquet(_f)) < _thresh:
+    if os.environ.get("BACKFILL_HISTORY") == "1":
+        from fund_flow_fetcher import _full_universe_threshold
+        from config import FUND_FLOW_DIR, STOCK_UNIVERSE_CSV
+        uni_codes = []
+        try:
+            _u = pd.read_csv(STOCK_UNIVERSE_CSV, dtype={"stock_code": str})
+            uni_codes = sorted(set(_u["stock_code"].astype(str).str.split(".").str[0].str.zfill(6)))
+            print(f">>> 资金流向回补清单：全市场 {len(uni_codes)} 只")
+        except Exception as _e:
+            print(f"⚠️ 全市场清单读取失败（{str(_e)[:60]}），跳过资金流回补")
+        if uni_codes:
+            _thresh = _full_universe_threshold()
+            broken = []
+            for _d in sorted(all_dates):
+                _f = FUND_FLOW_DIR / f"ff_{_d}.parquet"
+                if not _f.exists():
+                    continue
+                try:
+                    if len(pd.read_parquet(_f)) < _thresh:
+                        broken.append(_d)
+                except Exception:
                     broken.append(_d)
-            except Exception:
-                broken.append(_d)
-        if broken:
-            print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
-                  f"用全市场清单强制重拉")
-        _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
-        ff_deficit = (_ff_res or {}).get("deficit") or {}
+            if broken:
+                print(f">>> 检测到残缺资金流快照 {len(broken)} 天 {broken}（完整下限 {_thresh} 只），"
+                      f"用全市场清单强制重拉")
+            _ff_res = fetch_fund_flow_history(uni_codes, sorted(all_dates), overwrite_dates=broken or None)
+            ff_deficit = (_ff_res or {}).get("deficit") or {}
 
     # 1.9 全市场成交集中度（拥挤度）更新：T-1 口径，缺失日用腾讯日线补齐（无缺失秒级跳过）
     from crowd_fetcher import ensure_crowd_history
@@ -121,8 +124,9 @@ def main():
         dt = latest.get("trade_date", "-")
         print(f"  {name}: 融资余额 {rz/1e8:,.1f}亿 ({dt})")
 
-    # 数据完整性收口提示（本地模式下只警告，不阻塞启动看板）
+    # 数据完整性收口提示（仅本机补历史模式下有意义；正常启动看板时 ff_deficit 恒为空）
     if ff_deficit:
+        from fund_flow_fetcher import _full_universe_threshold
         print(f"\n❌ 资金流回补后仍有 {len(ff_deficit)} 天残缺（完整下限 {_full_universe_threshold()} 只）:")
         for _d, _n in sorted(ff_deficit.items()):
             print(f"     {_d}: {_n} 只")
